@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OrderMate — Orders</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; background: #f6f6f4; color: #222; }
+        h1 { margin-bottom: 0.25rem; }
+        p.sub { color: #666; margin-top: 0; margin-bottom: 1.5rem; }
+        table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-radius: 6px; overflow: hidden; }
+        th, td { text-align: left; padding: 0.65rem 0.9rem; border-bottom: 1px solid #eee; font-size: 0.88rem; vertical-align: top; }
+        th { background: #fafafa; font-weight: 600; color: #444; }
+        tr:last-child td { border-bottom: none; }
+        .phone { color: #888; font-size: 0.8rem; }
+        select { padding: 0.35rem; border-radius: 4px; border: 1px solid #ccc; font-size: 0.85rem; }
+        button { padding: 0.35rem 0.9rem; margin-left: 0.4rem; border-radius: 4px; border: 1px solid #333; background: #222; color: white; cursor: pointer; font-size: 0.85rem; }
+        button:hover { background: #444; }
+        .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 10px; font-size: 0.78rem; font-weight: 600; }
+        .badge-Confirmed { background: #fff3cd; color: #7a5c00; }
+        .badge-Preparing { background: #d6eaff; color: #0b5394; }
+        .badge-Out-for-Delivery { background: #e5d9ff; color: #4c1d95; }
+        .badge-Delivered { background: #d4f4e2; color: #0f6b3f; }
+        .badge-Cancelled { background: #fde0e0; color: #a02020; }
+        .empty { padding: 2rem; text-align: center; color: #888; }
+    </style>
+</head>
+<body>
+    <h1>🍲 Orders</h1>
+    <p class="sub">Most recent 100 orders. Update status and click Update to save.</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Ref</th>
+                <th>Customer</th>
+                <th>Item</th>
+                <th>Qty</th>
+                <th>Total</th>
+                <th>Delivery Address</th>
+                <th>Status</th>
+                <th>Placed</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for order in orders %}
+            <tr>
+                <td><strong>{{ order.order_ref }}</strong></td>
+                <td>
+                    {{ order.customer.name or "—" }}<br>
+                    <span class="phone">{{ order.customer.phone }}</span>
+                </td>
+                <td>{{ order.item }}</td>
+                <td>{{ order.quantity }}</td>
+                <td>₦{{ "{:,}".format(order.total_ngn) }}</td>
+                <td>{{ order.delivery_address }}</td>
+                <td><span class="badge badge-{{ order.status.replace(' ', '-') }}">{{ order.status }}</span></td>
+                <td>{{ order.created_at.strftime("%b %d, %H:%M") }}</td>
+                <td>
+                    <form method="post" action="/admin/orders/{{ order.order_ref }}/status" style="white-space: nowrap;">
+                        <select name="new_status">
+                            {% for s in statuses %}
+                            <option value="{{ s }}" {% if s == order.status %}selected{% endif %}>{{ s }}</option>
+                            {% endfor %}
+                        </select>
+                        <button type="submit">Update</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="9" class="empty">No orders yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
