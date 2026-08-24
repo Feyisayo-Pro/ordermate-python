@@ -2,7 +2,8 @@
 Unit tests for the rule-based fallback in app/ai.py (no OPENAI_API_KEY set in
 tests, so classify_intent always exercises _classify_intent_rules).
 """
-from app.ai import classify_intent
+from app.ai import classify_intent, transcribe_voice_note
+from app.config import get_settings
 
 
 def test_classify_intent_bare_three_is_human_handoff():
@@ -47,3 +48,12 @@ def test_classify_intent_acknowledgment_words():
     assert classify_intent("pay on delivery") == "acknowledgment"
     assert classify_intent("ok") == "acknowledgment"
     assert classify_intent("noted") == "acknowledgment"
+
+
+def test_transcribe_voice_note_returns_none_without_openai_configured():
+    # There's no rule-based fallback for audio — without a real transcription
+    # backend, the caller (main.py) needs a clear None to fall back to asking
+    # the customer to type instead.
+    settings = get_settings()
+    assert settings.openai_configured is False
+    assert transcribe_voice_note(b"fake audio bytes") is None

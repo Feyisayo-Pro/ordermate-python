@@ -290,3 +290,33 @@ def _parse_rating_rules(message: str) -> int:
     if any(w in lowered for w in positive_words):
         return 5
     return 3
+
+
+# ---------------------------------------------------------------------------
+# Voice note transcription
+# ---------------------------------------------------------------------------
+#
+# Unlike everything above, this has no rule-based fallback — there's no
+# meaningful deterministic way to "parse" arbitrary audio. It's fully gated
+# behind OPENAI_API_KEY; the caller (app/main.py) asks the customer to type
+# instead when it's not configured or transcription fails.
+#
+# SECURITY / PRIVACY NOTE: the raw voice note audio is sent to OpenAI's
+# Whisper API for transcription. This only happens when OPENAI_API_KEY is
+# explicitly configured — in the default zero-cost/rule-based deployment
+# mode, no customer audio ever leaves this server.
+
+
+def transcribe_voice_note(audio_bytes: bytes) -> str | None:
+    if not settings.openai_configured:
+        return None
+    try:
+        client = _get_openai_client()
+        resp = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=("voice_note.ogg", audio_bytes, "audio/ogg"),
+        )
+        return resp.text
+    except Exception:
+        log.exception("Voice note transcription failed")
+        return None

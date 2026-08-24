@@ -17,11 +17,11 @@ from fastapi import FastAPI, Request, Response, Depends, HTTPException
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
-from app import admin, conversation
+from app import admin, ai, conversation
 from app.config import get_settings
 from app.database import get_db, init_db
 from app.scheduler import start_scheduler
-from app.whatsapp_client import extract_incoming_message, send_typing_indicator, verify_webhook_signature
+from app.whatsapp_client import download_media, extract_incoming_message, send_message, send_typing_indicator, verify_webhook_signature
 
 logging.basicConfig(level=get_settings().LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ordermate.main")
@@ -82,9 +82,23 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
 
     send_typing_indicator(incoming["message_id"])
 
+    text = incoming["text"]
+    if incoming.get("media_id"):
+        # Voice note: download + transcribe, then feed the result through the
+        # exact same text pipeline as a typed message. If transcription isn't
+        # available (OPENAI_API_KEY not set) or fails, ask the customer to
+        # type instead rather than silently treating the voice note as an
+        # empty message — that used to just re-show the fallback menu with
+        # no acknowledgment we'd received anything at all.
+        audio_bytes = download_media(incoming["media_id"])
+        text = ai.transcribe_voice_note(audio_bytes) if audio_bytes else None
+        if not text:
+            send_message(incoming["phone"], "I can't listen to voice notes just yet 🙏 — could you type that for me instead?")
+            return {"status": "received"}
+
     try:
         conversation.handle_incoming_message(
-            db, phone=incoming["phone"], name=incoming["name"], text=incoming["text"]
+            db, phone=incoming["phone"], name=incoming["name"], text=text
         )
     except Exception:
         # Internal errors are logged, never leaked into the webhook response —

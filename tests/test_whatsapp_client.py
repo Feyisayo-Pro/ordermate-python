@@ -6,6 +6,7 @@ from app.whatsapp_client import (
     extract_incoming_message,
     send_typing_indicator,
     send_list_menu,
+    download_media,
     ListMenu,
     ListMenuSection,
     ListMenuRow,
@@ -61,7 +62,7 @@ def test_extract_incoming_message_parses_valid_payload():
         }}]}]
     }
     result = extract_incoming_message(payload)
-    assert result == {"phone": "234801", "name": "Tolu", "text": "hi", "message_id": "wamid.abc123"}
+    assert result == {"phone": "234801", "name": "Tolu", "text": "hi", "message_id": "wamid.abc123", "media_id": ""}
 
 
 def test_extract_incoming_message_returns_none_for_status_update():
@@ -91,7 +92,23 @@ def test_extract_incoming_message_normalizes_a_tapped_list_row_into_text():
         }}]}]
     }
     result = extract_incoming_message(payload)
-    assert result == {"phone": "234801", "name": "Tolu", "text": "Mains", "message_id": "wamid.xyz"}
+    assert result == {"phone": "234801", "name": "Tolu", "text": "Mains", "message_id": "wamid.xyz", "media_id": ""}
+
+
+def test_extract_incoming_message_returns_media_id_for_voice_note():
+    payload = {
+        "entry": [{"changes": [{"value": {
+            "messages": [{
+                "from": "234801",
+                "id": "wamid.voice1",
+                "type": "audio",
+                "audio": {"id": "media.abc123", "mime_type": "audio/ogg; codecs=opus"},
+            }],
+            "contacts": [{"profile": {"name": "Tolu"}}],
+        }}]}]
+    }
+    result = extract_incoming_message(payload)
+    assert result == {"phone": "234801", "name": "Tolu", "text": "", "message_id": "wamid.voice1", "media_id": "media.abc123"}
 
 
 def test_send_list_menu_is_dry_run_logged_when_not_configured(caplog):
@@ -125,3 +142,10 @@ def test_send_typing_indicator_is_noop_for_empty_message_id():
     finally:
         settings.WHATSAPP_ACCESS_TOKEN = ""
         settings.WHATSAPP_PHONE_NUMBER_ID = ""
+
+
+def test_download_media_is_noop_in_dry_run_mode():
+    settings = get_settings()
+    assert settings.whatsapp_configured is False
+    # No credentials configured -> no real API call is attempted
+    assert download_media("media.abc123") is None

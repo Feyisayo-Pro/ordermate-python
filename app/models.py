@@ -8,7 +8,9 @@ table and a Business table; the query patterns below don't have to change much.
 """
 from datetime import datetime, timezone
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import String, Integer, DateTime, ForeignKey, Text
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base

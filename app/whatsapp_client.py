@@ -180,6 +180,31 @@ def send_typing_indicator(message_id: str) -> bool:
         return False
 
 
+def download_media(media_id: str) -> bytes | None:
+    """
+    Downloads WhatsApp media (e.g. a voice note) via Meta's two-step Media
+    API: resolve media_id to a short-lived download URL, then fetch the
+    bytes from that URL — both steps need the same Bearer token. Returns
+    None in dry-run mode (no real media to fetch) or on any failure; never
+    raises, matching send_message's error-handling style.
+    """
+    if not settings.whatsapp_configured:
+        return None
+
+    headers = {"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN}"}
+    try:
+        meta_resp = httpx.get(f"{GRAPH_API_BASE}/{media_id}", headers=headers, timeout=10)
+        meta_resp.raise_for_status()
+        media_url = meta_resp.json()["url"]
+
+        media_resp = httpx.get(media_url, headers=headers, timeout=20)
+        media_resp.raise_for_status()
+        return media_resp.content
+    except (httpx.HTTPError, KeyError):
+        log.exception("Failed to download media %s", media_id)
+        return None
+
+
 def extract_incoming_message(payload: dict) -> dict | None:
     """
     Pulls the useful bits out of Meta's (fairly deeply nested) webhook payload.
@@ -202,8 +227,17 @@ def extract_incoming_message(payload: dict) -> dict | None:
         message = messages[0]
         contact = change.get("contacts", [{}])[0]
 
+        media_id = ""
         if message.get("type") == "interactive":
             text = message.get("interactive", {}).get("list_reply", {}).get("id", "")
+        elif message.get("type") == "audio":
+            # Voice notes carry no text at all — just a media_id to fetch.
+            # The caller (main.py) downloads and transcribes it, then feeds
+            # the result back through the same "text" pipeline as everything
+            # else, so conversation.py and ai.py never need to know a message
+            # started as audio.
+            text = ""
+            media_id = message.get("audio", {}).get("id", "")
         else:
             text = message.get("text", {}).get("body", "")
 
@@ -212,6 +246,7 @@ def extract_incoming_message(payload: dict) -> dict | None:
             "name": contact.get("profile", {}).get("name", ""),
             "text": text,
             "message_id": message.get("id", ""),
+            "media_id": media_id,
         }
     except (KeyError, IndexError, TypeError):
         return None

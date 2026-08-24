@@ -16,7 +16,9 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+# pyrefly: ignore [missing-import]
 from sqlalchemy import func
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
 from app import models

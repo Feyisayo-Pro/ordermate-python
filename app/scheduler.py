@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
+# pyrefly: ignore [missing-import]
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from app import database
@@ -97,6 +98,7 @@ def cancel_abandoned_order_nudge(customer_id: int):
     """Best-effort: called once an order completes so a stale nudge doesn't fire.
     Not load-bearing for correctness — send_abandoned_order_nudge re-checks the
     conversation state itself — this just avoids a wasted timer firing."""
+    # pyrefly: ignore [missing-import]
     from apscheduler.jobstores.base import JobLookupError
 
     try:
