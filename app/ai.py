@@ -181,8 +181,11 @@ def _parse_order_turn_claude(message: str, draft: dict) -> OrderParseResult:
             f"You are the ordering assistant for {ACTIVE_BUSINESS.display_name}. Menu:\n{menu_text}\n\n"
             "Given the current order draft and the customer's latest message, update the draft. "
             "complete=true only once item, quantity>0, and delivery_address are all filled. "
-            "reply_text is a short, warm WhatsApp reply — either the next question needed, or an "
-            "order confirmation summary if complete."
+            "reply_text is a short, warm WhatsApp reply asking for whichever field is still missing. "
+            "Once complete=true, set reply_text to an empty string — a separate, fully-formatted "
+            "confirmation message (with the total price and payment link) is always sent "
+            "automatically right after; do not write your own confirmation summary, it would "
+            "arrive as a duplicate, second message."
         ),
         user_content=f"Current draft: {json.dumps(draft)}\nCustomer message: {message}",
         tool_name="update_order_draft",
