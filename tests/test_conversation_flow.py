@@ -8,6 +8,7 @@ import logging
 
 from app import models
 from app.config import get_settings
+from app.conversation import _ordinal
 from app.scheduler import scheduler
 from tests.conftest import wait_until, whatsapp_list_reply_payload, whatsapp_payload
 
@@ -123,6 +124,108 @@ def test_quantity_question_matches_the_selected_items_category(client, db_sessio
         _send(client, "4")  # Chapman
     assert any("How many bottles?" in r.message for r in caplog.records)
     assert not any("How many plates?" in r.message for r in caplog.records)
+
+
+def test_cancel_mid_order_resets_to_idle(client, db_session, caplog):
+    _send(client, "order")
+    _send(client, "Mains")
+    with caplog.at_level(logging.INFO):
+        resp = _send(client, "cancel")
+    assert resp.status_code == 200
+    assert any("cancelled that" in r.message for r in caplog.records)
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    assert customer.conversation.state == "idle"
+    assert customer.conversation.draft_order == "{}"
+
+
+def test_cancel_also_works_as_start_over_at_any_step(client, db_session):
+    # Not just right after "order" — the check runs before every turn of
+    # _continue_order, so it should work regardless of which field is
+    # currently being asked for (category, item, quantity, address).
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "1")  # item picked, now being asked for quantity
+    resp = _send(client, "start over")
+    assert resp.status_code == 200
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    assert customer.conversation.state == "idle"
+
+
+def test_cancel_clears_the_abandoned_order_nudge(client, db_session):
+    _send(client, "order")
+    assert scheduler.get_job(f"abandoned-{db_session.query(models.Customer).filter_by(phone=PHONE).one().id}") is not None
+
+    _send(client, "cancel")
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    assert scheduler.get_job(f"abandoned-{customer.id}") is None
+
+
+def test_starting_a_new_order_after_cancelling_works_cleanly(client, db_session):
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "cancel")
+
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "1")
+    _send(client, "2")
+    resp = _send(client, "14 Adeyemi Street")
+    assert resp.status_code == 200
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    order = customer.orders[0]
+    assert order.item == "Jollof Rice + Chicken"
+    assert order.quantity == 2
+    assert customer.conversation.state == "idle"
+
+
+def test_ordinal_suffixes():
+    assert _ordinal(1) == "1st"
+    assert _ordinal(2) == "2nd"
+    assert _ordinal(3) == "3rd"
+    assert _ordinal(4) == "4th"
+    assert _ordinal(11) == "11th"
+    assert _ordinal(12) == "12th"
+    assert _ordinal(13) == "13th"
+    assert _ordinal(21) == "21st"
+    assert _ordinal(22) == "22nd"
+    assert _ordinal(23) == "23rd"
+    assert _ordinal(101) == "101st"
+
+
+def test_first_order_has_no_repeat_customer_note(client, caplog):
+    with caplog.at_level(logging.INFO):
+        _send(client, "order")
+        _send(client, "Mains")
+        _send(client, "1")
+        _send(client, "1")
+        _send(client, "14 Adeyemi Street")
+    assert not any("This is your" in r.message for r in caplog.records)
+
+
+def test_second_order_gets_repeat_customer_recognition(client, caplog):
+    settings = get_settings()
+    settings.OWNER_WHATSAPP_NUMBER = "2348099999999"
+    try:
+        _send(client, "order")
+        _send(client, "Mains")
+        _send(client, "1")
+        _send(client, "1")
+        _send(client, "14 Adeyemi Street")
+
+        with caplog.at_level(logging.INFO):
+            _send(client, "order")
+            _send(client, "Mains")
+            _send(client, "2")
+            _send(client, "1")
+            _send(client, "16 Adeyemi Street")
+
+        assert any("This is your 2nd order" in r.message for r in caplog.records)
+        assert any("repeat customer — 2nd order" in r.message for r in caplog.records)
+    finally:
+        settings.OWNER_WHATSAPP_NUMBER = ""
 
 
 def test_tapping_list_rows_completes_an_order_same_as_typing(client, db_session):

@@ -48,6 +48,14 @@ def _new_order_ref() -> str:
     return f"A-{random.randint(1000, 9999)}"
 
 
+def _ordinal(n: int) -> str:
+    if 11 <= (n % 100) <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
 def handle_incoming_message(db: Session, phone: str, name: str, text: str) -> list[str]:
     """
     Main entry point. Returns the list of reply texts sent to the customer
@@ -70,7 +78,15 @@ def handle_incoming_message(db: Session, phone: str, name: str, text: str) -> li
     if convo.state == "awaiting_feedback":
         replies = _handle_feedback(db, customer, convo, text)
     elif convo.state == "ordering":
-        replies = _continue_order(db, customer, convo, text)
+        # Checked before _continue_order, not through classify_intent — while
+        # mid-order, every reply is normally treated as an answer to whatever
+        # field is currently being asked for (category/item/quantity/address),
+        # so a general intent check never runs here. "Cancel" needs its own
+        # narrow, dedicated check for exactly that reason.
+        if _CANCEL_WORDS.search(text):
+            replies = _handle_cancel_order(customer, convo)
+        else:
+            replies = _continue_order(db, customer, convo, text)
     else:
         intent = ai.classify_intent(text)
         if intent == "new_order":
@@ -124,6 +140,19 @@ def _item_list_menu(body: str, category: str) -> ListMenu:
         for m in ACTIVE_BUSINESS.menu if m.category == category
     ]
     return ListMenu(body=body, button_text="Select Item", sections=[ListMenuSection(title=category, rows=rows)])
+
+
+_CANCEL_WORDS = re.compile(r"\b(cancel|start over|restart|nevermind|never ?mind|forget it|stop)\b", re.I)
+
+
+def _handle_cancel_order(customer: models.Customer, convo: models.Conversation) -> list[str]:
+    # Scoped deliberately to mid-flow only — cancelling an order that's
+    # already confirmed (Order.status flip + owner notification) is a
+    # separate, more consequential feature, not this one.
+    convo.state = "idle"
+    convo.draft_order = "{}"
+    cancel_abandoned_order_nudge(customer.id)
+    return ["No problem, I've cancelled that 👍 Let me know whenever you're ready to start again."]
 
 
 def _continue_order(db: Session, customer: models.Customer, convo: models.Conversation, text: str, first_turn: bool = False) -> list:
@@ -202,12 +231,20 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
     convo.draft_order = "{}"
     cancel_abandoned_order_nudge(customer.id)
 
+    # Recognition only, no discount — a real automatic discount is a pricing
+    # decision for the business owner to make deliberately, not something to
+    # bolt on here. Counts this order too (already flushed), so 2 == their
+    # 2nd order ever.
+    order_count = db.query(models.Order).filter_by(customer_id=customer.id).count()
+    is_repeat_customer = order_count >= 2
+
     # The owner needs to know a new order came in so prep can start — this
     # was missing entirely before: the owner only ever heard about low
     # ratings, human-handoff requests, and the weekly digest.
     if settings.OWNER_WHATSAPP_NUMBER:
+        repeat_note = f" (repeat customer — {_ordinal(order_count)} order)" if is_repeat_customer else ""
         owner_alert = (
-            f"🆕 New order #{order.order_ref}!\n"
+            f"🆕 New order #{order.order_ref}!{repeat_note}\n"
             f"{quantity}x {order.item} — ₦{order.total_ngn:,}\n"
             f"From: {customer.name or customer.phone} ({customer.phone})\n"
             f"Delivering to: {order.delivery_address}"
@@ -221,6 +258,8 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
         f"Delivering to: {order.delivery_address}\n\n"
         f"Pay on delivery or tap to pay now: {payment_link}"
     )
+    if is_repeat_customer:
+        confirmation += f"\n\n🌟 This is your {_ordinal(order_count)} order with us — thank you for coming back!"
     return [result.reply_text, confirmation] if result.reply_text and result.reply_text not in confirmation else [confirmation]
 
 
