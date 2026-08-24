@@ -1,8 +1,8 @@
 """
 End-to-end test of the full order -> delivery -> feedback -> review-request
 loop, driven entirely through the public HTTP interface (exactly what Meta's
-webhook would send), using the rule-based AI fallback (no OpenAI key needed —
-this is what makes the test deterministic and free to run).
+webhook would send), using the rule-based AI fallback (no Anthropic key
+needed — this is what makes the test deterministic and free to run).
 """
 import logging
 

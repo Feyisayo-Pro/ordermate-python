@@ -1,11 +1,11 @@
 """
 Centralized settings, loaded from environment variables (.env in local dev).
 
-Security note: every credential here (WhatsApp token, Meta app secret, OpenAI key)
-is read from the environment ONLY. Nothing is hardcoded. In production these should
-come from your platform's secret manager (Render/Railway secrets, AWS Secrets Manager,
-etc.) rather than a committed .env file — .env is for local development only and is
-gitignored in this project.
+Security note: every credential here (WhatsApp token, Meta app secret, Anthropic
+and Deepgram keys) is read from the environment ONLY. Nothing is hardcoded. In
+production these should come from your platform's secret manager (Render/Railway
+secrets, AWS Secrets Manager, etc.) rather than a committed .env file — .env is
+for local development only and is gitignored in this project.
 """
 from functools import lru_cache
 # pyrefly: ignore [missing-import]
@@ -32,11 +32,20 @@ class Settings(BaseSettings):
     WHATSAPP_APP_SECRET: str = ""          # used to verify incoming webhook signatures
     WHATSAPP_VERIFY_TOKEN: str = "ordermate_verify_me"  # you choose this; must match Meta dashboard
 
-    # --- OpenAI (optional in dev) ---
+    # --- Anthropic (optional in dev) ---
     # Without this, the app falls back to a simple rule-based intent/order parser
     # (see app/ai.py) so you can develop and demo the full flow with zero API cost.
-    OPENAI_API_KEY: str = ""
-    OPENAI_MODEL: str = "gpt-4o-mini"
+    # Defaults to Haiku rather than a flagship model — this bot's tasks (intent
+    # classification, structured field extraction) are lightweight and don't need
+    # a larger model's cost.
+    ANTHROPIC_API_KEY: str = ""
+    ANTHROPIC_MODEL: str = "claude-haiku-4-5-20251001"
+
+    # --- Deepgram (optional in dev) ---
+    # Powers voice note transcription (see app/ai.py::transcribe_voice_note).
+    # No rule-based fallback exists for audio, so without this, voice notes get
+    # a "please type instead" reply rather than being understood.
+    DEEPGRAM_API_KEY: str = ""
 
     # --- Business owner alerting ---
     OWNER_WHATSAPP_NUMBER: str = ""  # where low-rating alerts, human-handoff requests, and the weekly digest get sent
@@ -78,8 +87,12 @@ class Settings(BaseSettings):
         return bool(self.WHATSAPP_ACCESS_TOKEN and self.WHATSAPP_PHONE_NUMBER_ID)
 
     @property
-    def openai_configured(self) -> bool:
-        return bool(self.OPENAI_API_KEY)
+    def anthropic_configured(self) -> bool:
+        return bool(self.ANTHROPIC_API_KEY)
+
+    @property
+    def deepgram_configured(self) -> bool:
+        return bool(self.DEEPGRAM_API_KEY)
 
 
 @lru_cache

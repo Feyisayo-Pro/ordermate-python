@@ -1,16 +1,19 @@
 """
-AI layer: intent classification, order-detail extraction, rating extraction.
+AI layer: intent classification, order-detail extraction, rating extraction,
+voice note transcription.
 
-Every function here has two paths:
-  1. OpenAI-backed (used when OPENAI_API_KEY is set) — structured JSON output
-     via response_format={"type": "json_object"}.
+Every text-understanding function here has two paths:
+  1. Claude-backed (used when ANTHROPIC_API_KEY is set) — structured output
+     via forced tool use, Anthropic's equivalent of OpenAI's JSON mode.
   2. A rule-based fallback (used when no key is set) — good enough to run the
      full demo conversation deterministically, at zero cost, with no external
      calls. This is what lets you develop and test the whole app before you've
      signed up for anything.
 
 Both paths return the same shape, so callers (conversation.py) never need to
-know which one ran.
+know which one ran. Voice transcription is the one exception — there's no
+meaningful rule-based fallback for arbitrary audio, so it's gated behind
+DEEPGRAM_API_KEY alone with no fallback path; see its own section below.
 """
 from __future__ import annotations
 
@@ -18,6 +21,9 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+
+# pyrefly: ignore [missing-import]
+import httpx
 
 from app.business_config import ACTIVE_BUSINESS
 from app.config import get_settings
@@ -28,13 +34,34 @@ settings = get_settings()
 _client = None
 
 
-def _get_openai_client():
+def _get_anthropic_client():
     global _client
     if _client is None:
         # pyrefly: ignore [missing-import]
-        from openai import OpenAI  # imported lazily so the package is optional in dry-run/dev
-        _client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        from anthropic import Anthropic  # imported lazily so the package is optional in dry-run/dev
+        _client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
     return _client
+
+
+def _call_tool(system: str, user_content: str, tool_name: str, description: str, input_schema: dict) -> dict:
+    """
+    Shared helper for the "ask Claude for one structured object back" pattern
+    used by all three text-understanding functions below. Forcing tool_choice
+    to this one tool is Anthropic's equivalent of OpenAI's
+    response_format={"type": "json_object"} — it guarantees the response is
+    exactly this shape rather than free-form text we'd have to parse.
+    """
+    client = _get_anthropic_client()
+    resp = client.messages.create(
+        model=settings.ANTHROPIC_MODEL,
+        max_tokens=512,
+        system=system,
+        messages=[{"role": "user", "content": user_content}],
+        tools=[{"name": tool_name, "description": description, "input_schema": input_schema}],
+        tool_choice={"type": "tool", "name": tool_name},
+    )
+    tool_use = next(block for block in resp.content if block.type == "tool_use")
+    return tool_use.input
 
 
 # ---------------------------------------------------------------------------
@@ -45,42 +72,38 @@ VALID_INTENTS = {"new_order", "track_order", "feedback", "human_handoff", "ackno
 
 
 def classify_intent(text: str) -> str:
-    if settings.openai_configured:
+    if settings.anthropic_configured:
         try:
-            return _classify_intent_openai(text)
+            return _classify_intent_claude(text)
         except Exception:
-            log.exception("OpenAI intent classification failed — falling back to rules")
+            log.exception("Claude intent classification failed — falling back to rules")
     return _classify_intent_rules(text)
 
 
-def _classify_intent_openai(text: str) -> str:
-    client = _get_openai_client()
-    resp = client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You classify inbound WhatsApp messages for a small business bot. "
-                    'Reply with STRICT JSON only: {"intent": one of '
-                    '["new_order","track_order","feedback","human_handoff","acknowledgment","other"]}. '
-                    "'feedback' = replying with a rating/star/opinion about a past order. "
-                    "'track_order' = asking where their order is, OR the bare number 2 "
-                    "(the fallback menu's 'track an existing order' option). "
-                    "'new_order' = wants to buy/order something, OR the bare number 1 "
-                    "(the fallback menu's 'place an order' option). "
-                    "'human_handoff' = explicitly asking for a person/agent/customer care, "
-                    "or the bare number 3 (the fallback menu's 'speak to a human' option). "
-                    "'acknowledgment' = a short closing reply after an order was just confirmed "
-                    "(e.g. 'thanks', 'ok', 'pay on delivery', 'noted', 👍) that isn't asking for "
-                    "anything new."
-                ),
-            },
-            {"role": "user", "content": text},
-        ],
-        response_format={"type": "json_object"},
+def _classify_intent_claude(text: str) -> str:
+    data = _call_tool(
+        system=(
+            "You classify inbound WhatsApp messages for a small business bot. "
+            "'feedback' = replying with a rating/star/opinion about a past order. "
+            "'track_order' = asking where their order is, OR the bare number 2 "
+            "(the fallback menu's 'track an existing order' option). "
+            "'new_order' = wants to buy/order something, OR the bare number 1 "
+            "(the fallback menu's 'place an order' option). "
+            "'human_handoff' = explicitly asking for a person/agent/customer care, "
+            "or the bare number 3 (the fallback menu's 'speak to a human' option). "
+            "'acknowledgment' = a short closing reply after an order was just confirmed "
+            "(e.g. 'thanks', 'ok', 'pay on delivery', 'noted', 👍) that isn't asking for "
+            "anything new."
+        ),
+        user_content=text,
+        tool_name="classify_intent",
+        description="Record the classified intent of the customer's message.",
+        input_schema={
+            "type": "object",
+            "properties": {"intent": {"type": "string", "enum": sorted(VALID_INTENTS)}},
+            "required": ["intent"],
+        },
     )
-    data = json.loads(resp.choices[0].message.content)
     intent = data.get("intent", "other")
     return intent if intent in VALID_INTENTS else "other"
 
@@ -108,7 +131,7 @@ def _classify_intent_rules(text: str) -> str:
     # having asked (conversation.py's "unsolicited feedback" path) — the
     # normal flow bypasses classification entirely while state is already
     # "awaiting_feedback". This heuristic is intentionally coarse; the
-    # OpenAI-backed classifier (used automatically once OPENAI_API_KEY is
+    # Claude-backed classifier (used automatically once ANTHROPIC_API_KEY is
     # set) is what you want for reliable free-form understanding.
     stripped = text.strip()
     if stripped in _MENU_NUMBER_INTENTS:
@@ -143,37 +166,39 @@ def parse_order_turn(message: str, draft: dict) -> OrderParseResult:
     order, extract more fields and decide what to ask next (or confirm if
     the order is now complete).
     """
-    if settings.openai_configured:
+    if settings.anthropic_configured:
         try:
-            return _parse_order_turn_openai(message, draft)
+            return _parse_order_turn_claude(message, draft)
         except Exception:
-            log.exception("OpenAI order parsing failed — falling back to rules")
+            log.exception("Claude order parsing failed — falling back to rules")
     return _parse_order_turn_rules(message, draft)
 
 
-def _parse_order_turn_openai(message: str, draft: dict) -> OrderParseResult:
-    client = _get_openai_client()
+def _parse_order_turn_claude(message: str, draft: dict) -> OrderParseResult:
     menu_text = "\n".join(f"{m.number}. {m.name} — ₦{m.price_ngn}" for m in ACTIVE_BUSINESS.menu)
-    resp = client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    f"You are the ordering assistant for {ACTIVE_BUSINESS.display_name}. Menu:\n{menu_text}\n\n"
-                    "Given the current order draft (JSON) and the customer's latest message, update the draft "
-                    'and reply with STRICT JSON: {"item": "", "quantity": 0, "delivery_address": "", '
-                    '"complete": false, "reply_text": ""}. '
-                    "complete=true only once item, quantity>0, and delivery_address are all filled. "
-                    "reply_text is a short, warm WhatsApp reply — either the next question needed, or an "
-                    "order confirmation summary if complete."
-                ),
+    data = _call_tool(
+        system=(
+            f"You are the ordering assistant for {ACTIVE_BUSINESS.display_name}. Menu:\n{menu_text}\n\n"
+            "Given the current order draft and the customer's latest message, update the draft. "
+            "complete=true only once item, quantity>0, and delivery_address are all filled. "
+            "reply_text is a short, warm WhatsApp reply — either the next question needed, or an "
+            "order confirmation summary if complete."
+        ),
+        user_content=f"Current draft: {json.dumps(draft)}\nCustomer message: {message}",
+        tool_name="update_order_draft",
+        description="Record the updated order draft and the reply to send the customer.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "item": {"type": "string"},
+                "quantity": {"type": "integer"},
+                "delivery_address": {"type": "string"},
+                "complete": {"type": "boolean"},
+                "reply_text": {"type": "string"},
             },
-            {"role": "user", "content": f"Current draft: {json.dumps(draft)}\nCustomer message: {message}"},
-        ],
-        response_format={"type": "json_object"},
+            "required": ["item", "quantity", "delivery_address", "complete", "reply_text"],
+        },
     )
-    data = json.loads(resp.choices[0].message.content)
     new_draft = {
         "item": data.get("item", draft.get("item", "")),
         "quantity": data.get("quantity", draft.get("quantity", 0)),
@@ -244,25 +269,26 @@ _EMOJI_STAR_RE = re.compile(r"⭐️?")
 
 
 def parse_rating(message: str) -> int:
-    if settings.openai_configured:
+    if settings.anthropic_configured:
         try:
-            return _parse_rating_openai(message)
+            return _parse_rating_claude(message)
         except Exception:
-            log.exception("OpenAI rating parsing failed — falling back to rules")
+            log.exception("Claude rating parsing failed — falling back to rules")
     return _parse_rating_rules(message)
 
 
-def _parse_rating_openai(message: str) -> int:
-    client = _get_openai_client()
-    resp = client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": 'Extract a 1-5 star rating from the message. Reply STRICT JSON: {"rating": 1-5}. If unclear, estimate from sentiment.'},
-            {"role": "user", "content": message},
-        ],
-        response_format={"type": "json_object"},
+def _parse_rating_claude(message: str) -> int:
+    data = _call_tool(
+        system="Extract a 1-5 star rating from the message. If unclear, estimate from sentiment.",
+        user_content=message,
+        tool_name="extract_rating",
+        description="Record the extracted star rating.",
+        input_schema={
+            "type": "object",
+            "properties": {"rating": {"type": "integer", "minimum": 1, "maximum": 5}},
+            "required": ["rating"],
+        },
     )
-    data = json.loads(resp.choices[0].message.content)
     rating = int(data.get("rating", 3))
     return max(1, min(5, rating))
 
@@ -280,7 +306,7 @@ def _parse_rating_rules(message: str) -> int:
     # forms ("not great", "not good") explicitly — a naive substring check
     # for positive words alone would match "great" inside "not great" and
     # score a complaint as 5 stars. This is exactly the kind of nuance the
-    # OpenAI-backed path (used automatically once OPENAI_API_KEY is set)
+    # Claude-backed path (used automatically once ANTHROPIC_API_KEY is set)
     # handles properly; this fallback only needs to be reliable for the
     # scripted demo phrases, not arbitrary customer language.
     negative_words = ["not great", "not good", "not amazing", "bad", "poor", "disappointed", "terrible", "awful", "cold", "hated"]
@@ -297,26 +323,37 @@ def _parse_rating_rules(message: str) -> int:
 # ---------------------------------------------------------------------------
 #
 # Unlike everything above, this has no rule-based fallback — there's no
-# meaningful deterministic way to "parse" arbitrary audio. It's fully gated
-# behind OPENAI_API_KEY; the caller (app/main.py) asks the customer to type
-# instead when it's not configured or transcription fails.
+# meaningful deterministic way to "parse" arbitrary audio, and Anthropic
+# doesn't offer a speech-to-text API, so this runs on Deepgram instead of
+# Claude. Fully gated behind DEEPGRAM_API_KEY; the caller (app/main.py) asks
+# the customer to type instead when it's not configured or transcription
+# fails.
 #
-# SECURITY / PRIVACY NOTE: the raw voice note audio is sent to OpenAI's
-# Whisper API for transcription. This only happens when OPENAI_API_KEY is
-# explicitly configured — in the default zero-cost/rule-based deployment
-# mode, no customer audio ever leaves this server.
+# SECURITY / PRIVACY NOTE: the raw voice note audio is sent to Deepgram for
+# transcription. This only happens when DEEPGRAM_API_KEY is explicitly
+# configured — in the default zero-cost/rule-based deployment mode, no
+# customer audio ever leaves this server.
+
+DEEPGRAM_LISTEN_URL = "https://api.deepgram.com/v1/listen"
 
 
 def transcribe_voice_note(audio_bytes: bytes) -> str | None:
-    if not settings.openai_configured:
+    if not settings.deepgram_configured:
         return None
     try:
-        client = _get_openai_client()
-        resp = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=("voice_note.ogg", audio_bytes, "audio/ogg"),
+        resp = httpx.post(
+            DEEPGRAM_LISTEN_URL,
+            params={"model": "nova-2", "smart_format": "true"},
+            headers={
+                "Authorization": f"Token {settings.DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/ogg",
+            },
+            content=audio_bytes,
+            timeout=20,
         )
-        return resp.text
-    except Exception:
+        resp.raise_for_status()
+        data = resp.json()
+        return data["results"]["channels"][0]["alternatives"][0]["transcript"]
+    except (httpx.HTTPError, KeyError, IndexError):
         log.exception("Voice note transcription failed")
         return None

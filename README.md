@@ -17,12 +17,13 @@ FastAPI receives WhatsApp webhooks (`app/main.py`), a small explicit state
 machine per customer (`app/conversation.py` + the `Conversation` table)
 decides what's happening — are they mid-order, being asked for feedback, or
 starting fresh — and delegates the "what did they actually mean" understanding
-to `app/ai.py`, which calls OpenAI when a key is configured or falls back to
-deterministic rule-based parsing when it isn't. Everything persists to SQLite
-via SQLAlchemy (`app/models.py`). A background scheduler (`app/scheduler.py`)
-fires the feedback request a few hours after an order is marked delivered.
+to `app/ai.py`, which calls Anthropic's Claude when a key is configured or
+falls back to deterministic rule-based parsing when it isn't. Everything
+persists to SQLite via SQLAlchemy (`app/models.py`). A background scheduler
+(`app/scheduler.py`) fires the feedback request a few hours after an order is
+marked delivered.
 
-## Quickstart (no WhatsApp or OpenAI account needed)
+## Quickstart (no WhatsApp or Anthropic account needed)
 
 Requires **Python 3.11 or 3.12** (matches the Dockerfile). Newer interpreters
 (3.13+) may not yet have prebuilt wheels for pinned dependencies like
@@ -152,5 +153,7 @@ included). Whichever you choose:
   queue (Celery/RQ + Redis) before relying on this at scale.
 - The rule-based AI fallback is intentionally simple (built to run the demo
   conversation deterministically) — real customers typing in natural,
-  varied Nigerian English will need the OpenAI-backed path (`OPENAI_API_KEY`
+  varied Nigerian English will need the Claude-backed path (`ANTHROPIC_API_KEY`
   set) for reliable understanding in production.
+- Voice note transcription (`DEEPGRAM_API_KEY`) has no rule-based fallback —
+  without it, a voice note gets a "please type instead" reply.

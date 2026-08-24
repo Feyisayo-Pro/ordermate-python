@@ -37,8 +37,10 @@ def on_startup():
     start_scheduler()
     if not settings.whatsapp_configured:
         log.warning("WhatsApp credentials not set — running in DRY_RUN mode (outgoing messages are logged, not sent).")
-    if not settings.openai_configured:
-        log.warning("OPENAI_API_KEY not set — using rule-based fallback for intent/order/rating parsing.")
+    if not settings.anthropic_configured:
+        log.warning("ANTHROPIC_API_KEY not set — using rule-based fallback for intent/order/rating parsing.")
+    if not settings.deepgram_configured:
+        log.warning("DEEPGRAM_API_KEY not set — voice notes will get a 'please type instead' reply.")
 
 
 @app.get("/health")
@@ -86,7 +88,7 @@ async def receive_webhook(request: Request, db: Session = Depends(get_db)):
     if incoming.get("media_id"):
         # Voice note: download + transcribe, then feed the result through the
         # exact same text pipeline as a typed message. If transcription isn't
-        # available (OPENAI_API_KEY not set) or fails, ask the customer to
+        # available (DEEPGRAM_API_KEY not set) or fails, ask the customer to
         # type instead rather than silently treating the voice note as an
         # empty message — that used to just re-show the fallback menu with
         # no acknowledgment we'd received anything at all.
