@@ -152,6 +152,60 @@ def send_list_menu(to_phone: str, menu: ListMenu) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class ButtonOption:
+    id: str
+    title: str  # Meta caps this at 20 characters
+
+
+@dataclass(frozen=True)
+class ButtonMenu:
+    """
+    Native WhatsApp reply buttons — up to 3, rendered directly in the chat
+    (no extra tap to open a modal, unlike ListMenu). Use this instead of
+    ListMenu when there are 3 or fewer options; Meta doesn't support more
+    than 3 buttons in one message.
+    """
+    body: str
+    options: list[ButtonOption]
+
+
+def send_button_menu(to_phone: str, menu: ButtonMenu) -> bool:
+    """
+    Sends a WhatsApp interactive reply-button message. Mirrors send_message's
+    dry-run/error-handling behavior exactly — see its docstring.
+    """
+    if not settings.whatsapp_configured:
+        options_summary = ", ".join(o.title for o in menu.options)
+        log.info("[DRY_RUN] -> %s: [BUTTONS] %s | %s", to_phone, menu.body, options_summary)
+        return True
+
+    url = f"{GRAPH_API_BASE}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN}"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": menu.body},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": o.id, "title": o.title}}
+                    for o in menu.options
+                ],
+            },
+        },
+    }
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        return True
+    except httpx.HTTPError:
+        log.exception("Failed to send button menu to %s", to_phone)
+        return False
+
+
 def send_typing_indicator(message_id: str) -> bool:
     """
     Marks an inbound message as read and shows a "typing..." indicator to the
@@ -229,7 +283,13 @@ def extract_incoming_message(payload: dict) -> dict | None:
 
         media_id = ""
         if message.get("type") == "interactive":
-            text = message.get("interactive", {}).get("list_reply", {}).get("id", "")
+            interactive = message.get("interactive", {})
+            # A tapped list row and a tapped reply button are different
+            # sub-shapes ("list_reply" vs "button_reply") but both just carry
+            # an id — normalized into "text" the same way either way, so
+            # conversation.py/ai.py never need to know which UI was tapped.
+            reply = interactive.get("list_reply") or interactive.get("button_reply") or {}
+            text = reply.get("id", "")
         elif message.get("type") == "audio":
             # Voice notes carry no text at all — just a media_id to fetch.
             # The caller (main.py) downloads and transcribes it, then feeds

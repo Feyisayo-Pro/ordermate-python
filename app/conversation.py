@@ -25,7 +25,16 @@ from app import ai, models
 from app.business_config import ACTIVE_BUSINESS
 from app.config import get_settings
 from app.scheduler import cancel_abandoned_order_nudge, schedule_abandoned_order_nudge, schedule_feedback_request
-from app.whatsapp_client import ListMenu, ListMenuRow, ListMenuSection, send_list_menu, send_message
+from app.whatsapp_client import (
+    ButtonMenu,
+    ButtonOption,
+    ListMenu,
+    ListMenuRow,
+    ListMenuSection,
+    send_button_menu,
+    send_list_menu,
+    send_message,
+)
 
 log = logging.getLogger("ordermate.conversation")
 settings = get_settings()
@@ -120,6 +129,8 @@ def handle_incoming_message(db: Session, phone: str, name: str, text: str) -> li
     for r in replies:
         if isinstance(r, ListMenu):
             send_list_menu(phone, r)
+        elif isinstance(r, ButtonMenu):
+            send_button_menu(phone, r)
         else:
             send_message(phone, r)
     return replies
@@ -342,16 +353,21 @@ def _acknowledgment_message(customer: models.Customer) -> str:
     return f"You're welcome{name}! 😊 We'll take it from here."
 
 
-def _fallback_message(customer: models.Customer) -> str:
+def _fallback_message(customer: models.Customer) -> ButtonMenu:
     # Also the response to a bare greeting ("hi") — anything that doesn't match
     # a recognized intent lands here, so it doubles as the first impression for
     # a brand-new customer. Worth being warm and branded, not just functional.
+    # Button ids are "1"/"2"/"3" (not "new_order" etc.) deliberately — that's
+    # the same convention _MENU_NUMBER_INTENTS already handles for a typed
+    # reply, so a tapped button needs zero new logic in ai.py.
     name = f" {customer.name}" if customer.name else ""
-    return (
-        f"Hey{name}! {ACTIVE_BUSINESS.greeting_emoji} Welcome to {ACTIVE_BUSINESS.display_name}. Reply:\n"
-        f"1️⃣ to place an order\n"
-        f"2️⃣ to track an existing order\n"
-        f"3️⃣ to speak to a human"
+    return ButtonMenu(
+        body=f"Hey{name}! {ACTIVE_BUSINESS.greeting_emoji} Welcome to {ACTIVE_BUSINESS.display_name}. What would you like to do?",
+        options=[
+            ButtonOption(id="1", title="Place an order"),
+            ButtonOption(id="2", title="Track my order"),
+            ButtonOption(id="3", title="Speak to a human"),
+        ],
     )
 
 
@@ -411,8 +427,21 @@ def send_feedback_request(db: Session, order_id: int) -> None:
     db.commit()
 
     name = f" {customer.name}" if customer.name else ""
-    message = f"Hey{name} 🙌 Hope you loved your order! How would you rate it — 1 to 5 stars?"
-    send_message(customer.phone, message)
+    # 5 options > WhatsApp's 3-button cap, so this needs a list rather than
+    # buttons — row ids are "1".."5", the exact convention parse_rating's
+    # rule-based fallback already expects, so no ai.py changes needed.
+    rating_menu = ListMenu(
+        body=f"Hey{name} 🙌 Hope you loved your order! How would you rate it?",
+        button_text="Rate your order",
+        sections=[ListMenuSection(title="Rating", rows=[
+            ListMenuRow(id="5", title="⭐⭐⭐⭐⭐", description="Excellent!"),
+            ListMenuRow(id="4", title="⭐⭐⭐⭐", description="Great"),
+            ListMenuRow(id="3", title="⭐⭐⭐", description="Okay"),
+            ListMenuRow(id="2", title="⭐⭐", description="Not great"),
+            ListMenuRow(id="1", title="⭐", description="Poor"),
+        ])],
+    )
+    send_list_menu(customer.phone, rating_menu)
 
 
 # Absorbs the small, unavoidable gap between scheduling a nudge and the DB

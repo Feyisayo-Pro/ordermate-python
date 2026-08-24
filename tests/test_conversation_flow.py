@@ -291,6 +291,56 @@ def test_high_rating_feedback_moves_conversation_back_to_idle(client, db_session
     assert customer.conversation.state == "idle"
 
 
+def test_feedback_request_is_a_list_menu_not_plain_text(client, db_session, caplog):
+    # 5 rating options > WhatsApp's 3-button cap, so this has to be a list
+    # rather than reply buttons — unlike the fallback menu's 3 options.
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "1")
+    _send(client, "1")
+    _send(client, "Yaba, Lagos")
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    order = customer.orders[0]
+
+    def _list_menu_logged():
+        return any(
+            "[LIST MENU]" in r.message and "Rating (5 options)" in r.message
+            for r in caplog.records
+        )
+
+    # Poll for the actual log line, not just the state flip — send_feedback_
+    # request sets state=awaiting_feedback *before* building and sending the
+    # list menu, so waiting on state alone races the later send/log call
+    # under load. Caught live while stress-testing this exact suite.
+    with caplog.at_level(logging.INFO):
+        client.post(f"/admin/orders/{order.order_ref}/delivered")
+        assert wait_until(_list_menu_logged), "feedback-request list menu never logged"
+
+
+def test_tapping_a_star_rating_records_it_same_as_typing(client, db_session):
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "1")
+    _send(client, "1")
+    _send(client, "Yaba, Lagos")
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    order = customer.orders[0]
+    client.post(f"/admin/orders/{order.order_ref}/delivered")
+
+    def _is_awaiting_feedback():
+        db_session.refresh(customer.conversation)
+        return customer.conversation.state == "awaiting_feedback"
+
+    assert wait_until(_is_awaiting_feedback), "feedback-request job never fired"
+
+    _tap(client, "4", "⭐⭐⭐⭐")
+
+    feedback = db_session.query(models.Feedback).filter_by(order_id=order.id).one()
+    assert feedback.rating == 4
+
+
 def test_low_rating_does_not_request_a_review(client, db_session):
     _send(client, "order")
     _send(client, "Mains")
@@ -398,10 +448,31 @@ def test_bare_greeting_gets_a_warm_branded_fallback(client, caplog):
     # "hi" doesn't match any recognized intent, so it falls through to the same
     # fallback message shown for genuinely unrecognized input — which doubles
     # as a new customer's first impression, so it should welcome them by name.
+    # 3 options fits WhatsApp's button cap, so this is native reply buttons
+    # rather than a list (unlike the 5-option star rating).
     with caplog.at_level(logging.INFO):
         resp = _send(client, "hi")
     assert resp.status_code == 200
-    assert any("Mama's Kitchen" in r.message and "Welcome" in r.message for r in caplog.records)
+    assert any(
+        "[BUTTONS]" in r.message and "Mama's Kitchen" in r.message and "Welcome" in r.message
+        for r in caplog.records
+    )
+
+
+def test_tapping_the_fallback_menus_track_button_tracks_the_order(client, db_session):
+    # Button ids are "1"/"2"/"3", the same convention a typed reply already
+    # used — tapping "Track my order" should work identically to typing "2".
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "1")
+    _send(client, "1")
+    _send(client, "Yaba, Lagos")
+
+    resp = _tap(client, "2", "Track my order")
+    assert resp.status_code == 200
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    assert len(customer.orders) == 1
 
 
 def test_replying_two_to_the_fallback_menu_tracks_the_order_not_a_loop(client, db_session, caplog):

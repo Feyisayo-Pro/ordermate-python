@@ -6,10 +6,13 @@ from app.whatsapp_client import (
     extract_incoming_message,
     send_typing_indicator,
     send_list_menu,
+    send_button_menu,
     download_media,
     ListMenu,
     ListMenuSection,
     ListMenuRow,
+    ButtonMenu,
+    ButtonOption,
 )
 from app.config import get_settings
 
@@ -95,6 +98,25 @@ def test_extract_incoming_message_normalizes_a_tapped_list_row_into_text():
     assert result == {"phone": "234801", "name": "Tolu", "text": "Mains", "message_id": "wamid.xyz", "media_id": ""}
 
 
+def test_extract_incoming_message_normalizes_a_tapped_button_into_text():
+    # A tapped reply button is a *different* interactive sub-shape than a
+    # tapped list row ("button_reply" vs "list_reply") — same normalization
+    # goal, distinct payload shape worth its own regression test.
+    payload = {
+        "entry": [{"changes": [{"value": {
+            "messages": [{
+                "from": "234801",
+                "id": "wamid.btn1",
+                "type": "interactive",
+                "interactive": {"type": "button_reply", "button_reply": {"id": "2", "title": "Track my order"}},
+            }],
+            "contacts": [{"profile": {"name": "Tolu"}}],
+        }}]}]
+    }
+    result = extract_incoming_message(payload)
+    assert result == {"phone": "234801", "name": "Tolu", "text": "2", "message_id": "wamid.btn1", "media_id": ""}
+
+
 def test_extract_incoming_message_returns_media_id_for_voice_note():
     payload = {
         "entry": [{"changes": [{"value": {
@@ -124,6 +146,20 @@ def test_send_list_menu_is_dry_run_logged_when_not_configured(caplog):
     with caplog.at_level(logging.INFO):
         assert send_list_menu("234801", menu) is True
     assert any("[LIST MENU]" in r.message and "Pick a category" in r.message for r in caplog.records)
+
+
+def test_send_button_menu_is_dry_run_logged_when_not_configured(caplog):
+    import logging
+
+    settings = get_settings()
+    assert settings.whatsapp_configured is False
+    menu = ButtonMenu(
+        body="What would you like to do?",
+        options=[ButtonOption(id="1", title="Place an order")],
+    )
+    with caplog.at_level(logging.INFO):
+        assert send_button_menu("234801", menu) is True
+    assert any("[BUTTONS]" in r.message and "What would you like to do?" in r.message for r in caplog.records)
 
 
 def test_send_typing_indicator_is_noop_in_dry_run_mode():
