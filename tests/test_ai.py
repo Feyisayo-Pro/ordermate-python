@@ -2,7 +2,8 @@
 Unit tests for the rule-based fallback in app/ai.py (no ANTHROPIC_API_KEY set
 in tests, so classify_intent always exercises _classify_intent_rules).
 """
-from app.ai import classify_intent, transcribe_voice_note
+from app import ai
+from app.ai import classify_intent, parse_order_turn, transcribe_voice_note
 from app.config import get_settings
 
 
@@ -57,3 +58,42 @@ def test_transcribe_voice_note_returns_none_without_deepgram_configured():
     settings = get_settings()
     assert settings.deepgram_configured is False
     assert transcribe_voice_note(b"fake audio bytes") is None
+
+
+def test_parse_order_turn_claude_preserves_fields_it_does_not_manage(monkeypatch):
+    # Regression: caught live — the Claude path built its returned draft from
+    # scratch with only item/quantity/delivery_address, silently dropping
+    # "category", "_unit_price", and "_quantity_unit" that conversation.py
+    # stashes on this same dict. Since that draft *replaces* the stored one,
+    # this reset a real conversation back to "pick a category" immediately
+    # after the customer supplied the delivery address — the very last field
+    # of the order.
+    settings = get_settings()
+    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(
+        ai,
+        "_call_tool",
+        lambda **kwargs: {
+            "item": "Ofada + Beef",
+            "quantity": 3,
+            "delivery_address": "3 Awise Ogundare lane",
+            "complete": True,
+            "reply_text": "All set!",
+        },
+    )
+
+    existing_draft = {
+        "category": "Mains",
+        "item": "Ofada + Beef",
+        "_unit_price": 4500,
+        "_quantity_unit": "plates",
+        "quantity": 0,
+        "delivery_address": "",
+    }
+    result = parse_order_turn("3 Awise Ogundare lane", existing_draft)
+
+    assert result.draft["category"] == "Mains"
+    assert result.draft["_unit_price"] == 4500
+    assert result.draft["_quantity_unit"] == "plates"
+    assert result.draft["delivery_address"] == "3 Awise Ogundare lane"
+    assert result.complete is True

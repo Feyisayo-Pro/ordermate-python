@@ -91,6 +91,18 @@ def test_unmatched_item_reply_reshows_that_categorys_items(client, caplog):
     )
 
 
+def test_typing_the_items_exact_name_selects_it_same_as_the_number(client, caplog):
+    # The list message shows the item's name prominently — a customer typing
+    # it back instead of tapping is completely natural and should still work,
+    # not just the underlying row number.
+    _send(client, "order")
+    _send(client, "Mains")
+    with caplog.at_level(logging.INFO):
+        _send(client, "Ofada + Beef")
+    assert any("How many plates?" in r.message for r in caplog.records)
+    assert not any("Not sure I caught that" in r.message for r in caplog.records)
+
+
 def test_quantity_question_matches_the_selected_items_category(client, db_session, caplog):
     # Caught live: selecting a drink still asked "How many plates?" — the
     # quantity unit needs to follow what was actually picked, not be hardcoded

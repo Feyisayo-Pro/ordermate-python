@@ -157,8 +157,16 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
         return [_item_list_menu(f"Great, here's what's in {chosen}:", chosen)]
 
     if not draft.get("item"):
-        items_in_category = {m.number: m for m in ACTIVE_BUSINESS.menu if m.category == draft["category"]}
-        chosen_item = items_in_category.get(text.strip())
+        category_items = [m for m in ACTIVE_BUSINESS.menu if m.category == draft["category"]]
+        stripped = text.strip()
+        # Matches a tapped row (id == number) or the row's number typed
+        # directly, but also the item's exact name — the list message shows
+        # the name prominently, and a customer typing it back instead of
+        # tapping is a completely natural thing to do.
+        chosen_item = next(
+            (m for m in category_items if m.number == stripped or m.name.lower() == stripped.lower()),
+            None,
+        )
         schedule_abandoned_order_nudge(customer.id)
         if not chosen_item:
             return [_item_list_menu(f"Not sure I caught that — here's {draft['category']} again:", draft["category"])]

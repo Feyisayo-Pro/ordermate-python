@@ -199,11 +199,17 @@ def _parse_order_turn_claude(message: str, draft: dict) -> OrderParseResult:
             "required": ["item", "quantity", "delivery_address", "complete", "reply_text"],
         },
     )
-    new_draft = {
-        "item": data.get("item", draft.get("item", "")),
-        "quantity": data.get("quantity", draft.get("quantity", 0)),
-        "delivery_address": data.get("delivery_address", draft.get("delivery_address", "")),
-    }
+    # Start from the FULL existing draft, not just the three fields Claude
+    # manages — conversation.py stashes "category", "_unit_price", and
+    # "_quantity_unit" on this same dict before ever delegating here,  and a
+    # draft built from scratch would silently drop them, resetting the
+    # customer back to "pick a category" on their very next reply. Caught
+    # live: this exact bug reset a real conversation right after the address
+    # was captured, the very last field of the order.
+    new_draft = dict(draft)
+    new_draft["item"] = data.get("item", draft.get("item", ""))
+    new_draft["quantity"] = data.get("quantity", draft.get("quantity", 0))
+    new_draft["delivery_address"] = data.get("delivery_address", draft.get("delivery_address", ""))
     return OrderParseResult(draft=new_draft, complete=bool(data.get("complete")), reply_text=data.get("reply_text", ""))
 
 
