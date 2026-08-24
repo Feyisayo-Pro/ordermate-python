@@ -97,3 +97,39 @@ def test_parse_order_turn_claude_preserves_fields_it_does_not_manage(monkeypatch
     assert result.draft["_quantity_unit"] == "plates"
     assert result.draft["delivery_address"] == "3 Awise Ogundare lane"
     assert result.complete is True
+
+
+def test_parse_order_turn_claude_cannot_change_the_item(monkeypatch):
+    # Regression: caught live — "item" used to be a Claude-writable field.
+    # When a customer asked for a second item mid-flow ("Drinks"), Claude
+    # "helpfully" crammed both into the item string ("Ofada + Beef,
+    # Coca-Cola") — but pricing (_unit_price * quantity) only ever reflected
+    # the original item, so the order silently undercharged for the second
+    # one. "item" is no longer in Claude's tool schema at all; this locks in
+    # that it's structurally impossible for Claude's response to change it,
+    # regardless of what a mocked (or real) response might contain.
+    settings = get_settings()
+    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(
+        ai,
+        "_call_tool",
+        lambda **kwargs: {
+            "quantity": 3,
+            "delivery_address": "",
+            "complete": False,
+            "reply_text": "This order is for the Ofada + Beef you've already chosen.",
+        },
+    )
+
+    existing_draft = {
+        "category": "Mains",
+        "item": "Ofada + Beef",
+        "_unit_price": 4500,
+        "_quantity_unit": "plates",
+        "quantity": 3,
+        "delivery_address": "",
+    }
+    result = parse_order_turn("Can I also get a Coca-Cola", existing_draft)
+
+    assert result.draft["item"] == "Ofada + Beef"
+    assert result.draft["_unit_price"] == 4500

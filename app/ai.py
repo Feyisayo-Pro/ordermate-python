@@ -175,13 +175,28 @@ def parse_order_turn(message: str, draft: dict) -> OrderParseResult:
 
 
 def _parse_order_turn_claude(message: str, draft: dict) -> OrderParseResult:
+    # This is only ever called once conversation.py's own hardcoded logic has
+    # already locked in "category" and "item" (see _continue_order) — Claude
+    # only ever handles quantity and delivery_address from here. "item" is
+    # deliberately NOT in the tool schema below: this system has no concept
+    # of a multi-item order, and giving Claude write access to "item" let it
+    # "helpfully" cram a second item in as a string (e.g. "Ofada + Beef,
+    # Coca-Cola") when a customer asked for something else mid-flow — the
+    # order still only priced the original item, silently undercharging.
+    # Caught live. Structurally impossible now, not just prompted against.
     menu_text = "\n".join(f"{m.number}. {m.name} — ₦{m.price_ngn}" for m in ACTIVE_BUSINESS.menu)
     data = _call_tool(
         system=(
             f"You are the ordering assistant for {ACTIVE_BUSINESS.display_name}. Menu:\n{menu_text}\n\n"
-            "Given the current order draft and the customer's latest message, update the draft. "
-            "complete=true only once item, quantity>0, and delivery_address are all filled. "
-            "reply_text is a short, warm WhatsApp reply asking for whichever field is still missing. "
+            f"The customer has already chosen: {draft.get('item', '?')}. This system takes exactly "
+            "ONE item per order — you cannot add a second item to this order. If the customer asks "
+            "for something else or an additional item, politely explain that this order is for the "
+            "item already chosen, and they're welcome to place a separate order for anything else "
+            "once this one is done. Do not try to accommodate a second item.\n\n"
+            "Otherwise, given the customer's latest message, extract the quantity and/or delivery "
+            "address still needed. complete=true only once quantity>0 and delivery_address are both "
+            "filled. reply_text is a short, warm WhatsApp reply asking for whichever field is still "
+            "missing, or the polite redirect described above if they asked for something else. "
             "Once complete=true, set reply_text to an empty string — a separate, fully-formatted "
             "confirmation message (with the total price and payment link) is always sent "
             "automatically right after; do not write your own confirmation summary, it would "
@@ -193,24 +208,22 @@ def _parse_order_turn_claude(message: str, draft: dict) -> OrderParseResult:
         input_schema={
             "type": "object",
             "properties": {
-                "item": {"type": "string"},
                 "quantity": {"type": "integer"},
                 "delivery_address": {"type": "string"},
                 "complete": {"type": "boolean"},
                 "reply_text": {"type": "string"},
             },
-            "required": ["item", "quantity", "delivery_address", "complete", "reply_text"],
+            "required": ["quantity", "delivery_address", "complete", "reply_text"],
         },
     )
-    # Start from the FULL existing draft, not just the three fields Claude
-    # manages — conversation.py stashes "category", "_unit_price", and
-    # "_quantity_unit" on this same dict before ever delegating here,  and a
+    # Start from the FULL existing draft, not just the fields Claude manages
+    # — conversation.py stashes "category", "item", "_unit_price", and
+    # "_quantity_unit" on this same dict before ever delegating here, and a
     # draft built from scratch would silently drop them, resetting the
     # customer back to "pick a category" on their very next reply. Caught
     # live: this exact bug reset a real conversation right after the address
     # was captured, the very last field of the order.
     new_draft = dict(draft)
-    new_draft["item"] = data.get("item", draft.get("item", ""))
     new_draft["quantity"] = data.get("quantity", draft.get("quantity", 0))
     new_draft["delivery_address"] = data.get("delivery_address", draft.get("delivery_address", ""))
     return OrderParseResult(draft=new_draft, complete=bool(data.get("complete")), reply_text=data.get("reply_text", ""))
