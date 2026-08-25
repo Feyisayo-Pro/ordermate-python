@@ -185,6 +185,14 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
         convo.draft_order = "{}"
         return [_category_list_menu(f"{greeting}Here's today's menu — pick a category:")]
 
+    if draft.get("awaiting_address"):
+        # Checked before the category check below: an item was just added to
+        # the cart and "category" was deliberately cleared at that point (see
+        # the quantity-capture branch further down), so this MUST be checked
+        # first or that empty "category" would wrongly route here into
+        # "pick a category" instead.
+        return _continue_cart_or_address(db, customer, convo, draft, text)
+
     if not draft.get("category"):
         # Case-insensitive: matches both a tapped list row (id == category
         # name) and a customer typing the category name directly.
@@ -216,26 +224,109 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
         convo.draft_order = json.dumps(draft)
         return [f"Great choice 😋 How many {chosen_item.quantity_unit}?"]
 
-    result = ai.parse_order_turn(text, draft)
-    convo.draft_order = json.dumps(result.draft)
+    # Item chosen, quantity still needed — a single, narrow extraction (see
+    # ai.parse_quantity's docstring for why this used to be combined with
+    # delivery_address, and why that was the root of a real money-correctness
+    # bug: this system now supports real multi-item carts, but each field
+    # gets its own turn regardless).
+    quantity_unit = draft.get("_quantity_unit", "plates")
+    qty = ai.parse_quantity(text, quantity_unit)
+    schedule_abandoned_order_nudge(customer.id)
+    if not qty:
+        return [f"Sorry, how many {quantity_unit}?"]
 
-    if not result.complete:
-        schedule_abandoned_order_nudge(customer.id)
-        return [result.reply_text]
+    cart = draft.get("cart", [])
+    subtotal = draft["_unit_price"] * qty
+    cart.append({
+        "item": draft["item"],
+        "quantity": qty,
+        "unit_price": draft["_unit_price"],
+        "quantity_unit": quantity_unit,
+        "subtotal": subtotal,
+    })
+    draft["cart"] = cart
+    for key in ("category", "item", "_unit_price", "_quantity_unit"):
+        draft.pop(key, None)
+    draft["awaiting_address"] = True
+    convo.draft_order = json.dumps(draft)
 
-    # Order complete -> persist it, confirm, reset state
-    unit_price = result.draft.get("_unit_price", 0)
-    quantity = int(result.draft.get("quantity", 1))
+    if len(cart) == 1:
+        return [
+            f"Got it — {qty}x {cart[0]['item']} = ₦{subtotal:,}\n\n"
+            "What's the delivery address? (Or let me know if you'd like to add another item.)"
+        ]
+    cart_lines = "\n".join(f"{i['quantity']}x {i['item']} — ₦{i['subtotal']:,}" for i in cart)
+    cart_total = sum(i["subtotal"] for i in cart)
+    return [
+        f"Added! Your cart so far:\n{cart_lines}\nTotal: ₦{cart_total:,}\n\n"
+        "What's the delivery address? (Or let me know if you'd like to add another item.)"
+    ]
+
+
+def _continue_cart_or_address(db: Session, customer: models.Customer, convo: models.Conversation, draft: dict, text: str) -> list:
+    """
+    Handles the turn right after an item was added to the cart: the customer
+    is either naming another item to add, or giving their delivery address.
+    Deliberately does NOT force a button tap for this — a customer typing
+    their address directly (the common single-item case) should work exactly
+    as it always has; only text that actually looks like "add another item"
+    diverts into that path.
+    """
+    categories = _menu_categories()
+    decision = ai.classify_cart_continuation(text, categories)
+    schedule_abandoned_order_nudge(customer.id)
+
+    if decision.wants_more:
+        draft.pop("awaiting_address", None)
+        if decision.category:
+            draft["category"] = decision.category
+            convo.draft_order = json.dumps(draft)
+            return [_item_list_menu(f"Sure — here's what's in {decision.category}:", decision.category)]
+        if len(categories) <= 1:
+            only_category = categories[0] if categories else ""
+            draft["category"] = only_category
+            convo.draft_order = json.dumps(draft)
+            return [_item_list_menu(f"Sure — here's what's in {only_category}:", only_category)]
+        convo.draft_order = json.dumps(draft)
+        return [_category_list_menu("Sure — pick a category for the next item:")]
+
+    if not decision.has_address:
+        # Confirms they're done adding items ("checkout", "that's all"), but
+        # doesn't itself contain an address — still need to actually ask for
+        # it, not silently save the confirmation phrase as the address.
+        return ["Great — what's the delivery address?"]
+
+    stripped = text.strip()
+    if len(stripped) < 4 or stripped.isdigit():
+        return ["What's the delivery address?"]
+
+    return _finalize_order(db, customer, convo, draft, stripped)
+
+
+def _finalize_order(db: Session, customer: models.Customer, convo: models.Conversation, draft: dict, delivery_address: str) -> list[str]:
+    cart = draft["cart"]
+    cart_total = sum(i["subtotal"] for i in cart)
+    single = len(cart) == 1
     order = models.Order(
         order_ref=_new_order_ref(),
         customer_id=customer.id,
-        item=result.draft.get("item", ""),
-        quantity=quantity,
-        delivery_address=result.draft.get("delivery_address", ""),
-        total_ngn=unit_price * quantity,
+        item=cart[0]["item"] if single else ", ".join(f"{i['quantity']}x {i['item']}" for i in cart),
+        quantity=cart[0]["quantity"] if single else sum(i["quantity"] for i in cart),
+        delivery_address=delivery_address,
+        total_ngn=cart_total,
         status="Confirmed",
     )
     db.add(order)
+    db.flush()
+    for i in cart:
+        db.add(models.OrderItem(
+            order_id=order.id,
+            item=i["item"],
+            quantity=i["quantity"],
+            quantity_unit=i.get("quantity_unit", "plates"),
+            unit_price_ngn=i["unit_price"],
+            subtotal_ngn=i["subtotal"],
+        ))
     db.flush()
 
     convo.state = "idle"
@@ -248,6 +339,7 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
     # 2nd order ever.
     order_count = db.query(models.Order).filter_by(customer_id=customer.id).count()
     is_repeat_customer = order_count >= 2
+    items_lines = "\n".join(f"  {i['quantity']}x {i['item']}" for i in cart)
 
     # The owner needs to know a new order came in so prep can start — this
     # was missing entirely before: the owner only ever heard about low
@@ -256,22 +348,26 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
         repeat_note = f" (repeat customer — {_ordinal(order_count)} order)" if is_repeat_customer else ""
         owner_alert = (
             f"🆕 New order #{order.order_ref}!{repeat_note}\n"
-            f"{quantity}x {order.item} — ₦{order.total_ngn:,}\n"
+            f"{items_lines}\n"
+            f"Total: ₦{order.total_ngn:,}\n"
             f"From: {customer.name or customer.phone} ({customer.phone})\n"
             f"Delivering to: {order.delivery_address}"
         )
         send_message(settings.OWNER_WHATSAPP_NUMBER, owner_alert)
 
     payment_link = f"{ACTIVE_BUSINESS.payment_link_base}{order.order_ref.split('-')[-1]}"
+    items_summary = "\n".join(f"{i['quantity']}x {i['item']} — ₦{i['subtotal']:,}" for i in cart)
     confirmation = (
         f"All set{', ' + customer.name if customer.name else ''}! 🎉\n"
-        f"Order #{order.order_ref} confirmed — ₦{order.total_ngn:,}\n"
+        f"Order #{order.order_ref} confirmed\n"
+        f"{items_summary}\n"
+        f"Total: ₦{order.total_ngn:,}\n"
         f"Delivering to: {order.delivery_address}\n\n"
         f"Pay on delivery or tap to pay now: {payment_link}"
     )
     if is_repeat_customer:
         confirmation += f"\n\n🌟 This is your {_ordinal(order_count)} order with us — thank you for coming back!"
-    return [result.reply_text, confirmation] if result.reply_text and result.reply_text not in confirmation else [confirmation]
+    return [confirmation]
 
 
 _DELIVERED_COMMAND_RE = re.compile(r"^delivered\s+#?([A-Za-z]+-?\d+)$", re.I)

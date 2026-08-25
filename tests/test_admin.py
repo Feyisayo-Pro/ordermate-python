@@ -70,6 +70,34 @@ def test_dashboard_shows_orders_with_correct_credentials(client, admin_auth, db_
     assert "14 Adeyemi Street" in resp.text
 
 
+def test_dashboard_shows_each_cart_line_item_separately(client, admin_auth, db_session):
+    # A real multi-item order (OrderItem rows present) should show each item
+    # on its own line, not the legacy single "item" summary column value.
+    customer = models.Customer(phone="2348011112222", name="Bola")
+    db_session.add(customer)
+    db_session.flush()
+    db_session.add(models.Conversation(customer_id=customer.id, state="idle", draft_order="{}"))
+    order = models.Order(
+        order_ref="A-2222",
+        customer_id=customer.id,
+        item="2x Fried Rice + Turkey, 1x Coca-Cola",
+        quantity=3,
+        delivery_address="3 Ogundare Awise lane",
+        total_ngn=8500,
+        status="Confirmed",
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(models.OrderItem(order_id=order.id, item="Fried Rice + Turkey", quantity=2, quantity_unit="plates", unit_price_ngn=4000, subtotal_ngn=8000))
+    db_session.add(models.OrderItem(order_id=order.id, item="Coca-Cola", quantity=1, quantity_unit="bottles", unit_price_ngn=500, subtotal_ngn=500))
+    db_session.commit()
+
+    resp = client.get("/admin/orders", auth=admin_auth)
+    assert resp.status_code == 200
+    assert "Fried Rice + Turkey" in resp.text
+    assert "Coca-Cola" in resp.text
+
+
 def test_dashboard_shows_empty_state_with_no_orders(client, admin_auth):
     resp = client.get("/admin/orders", auth=admin_auth)
     assert resp.status_code == 200

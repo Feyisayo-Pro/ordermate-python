@@ -17,7 +17,6 @@ DEEPGRAM_API_KEY alone with no fallback path; see its own section below.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -150,136 +149,168 @@ def _classify_intent_rules(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Order parsing (incremental — fills in a partial draft over multiple turns)
+# Quantity parsing — how many of the item the customer already picked
 # ---------------------------------------------------------------------------
 
-@dataclass
-class OrderParseResult:
-    draft: dict
-    complete: bool
-    reply_text: str
+_QTY_RE = re.compile(r"(\d+)\s*(plate|piece|pcs|bottle|x)?", re.I)
+_QTY_WORDS = {
+    "a": 1, "an": 1, "single": 1, "one": 1, "two": 2, "couple": 2, "three": 3,
+    "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
 
 
-def parse_order_turn(message: str, draft: dict) -> OrderParseResult:
+def parse_quantity(message: str, quantity_unit: str) -> int | None:
     """
-    Given the customer's latest message and whatever's already in the draft
-    order, extract more fields and decide what to ask next (or confirm if
-    the order is now complete).
+    Extracts how many of the already-chosen item the customer wants. Scoped
+    to exactly this one field — quantity used to be extracted together with
+    delivery_address in a single combined call, which is what let Claude
+    also "helpfully" try to change the item itself (see git history). Each
+    field now has its own narrow, single-purpose extraction step.
     """
     if settings.anthropic_configured:
         try:
-            return _parse_order_turn_claude(message, draft)
+            return _parse_quantity_claude(message, quantity_unit)
         except Exception:
-            log.exception("Claude order parsing failed — falling back to rules")
-    return _parse_order_turn_rules(message, draft)
+            log.exception("Claude quantity parsing failed — falling back to rules")
+    return _parse_quantity_rules(message)
 
 
-def _parse_order_turn_claude(message: str, draft: dict) -> OrderParseResult:
-    # This is only ever called once conversation.py's own hardcoded logic has
-    # already locked in "category" and "item" (see _continue_order) — Claude
-    # only ever handles quantity and delivery_address from here. "item" is
-    # deliberately NOT in the tool schema below: this system has no concept
-    # of a multi-item order, and giving Claude write access to "item" let it
-    # "helpfully" cram a second item in as a string (e.g. "Ofada + Beef,
-    # Coca-Cola") when a customer asked for something else mid-flow — the
-    # order still only priced the original item, silently undercharging.
-    # Caught live. Structurally impossible now, not just prompted against.
-    menu_text = "\n".join(f"{m.number}. {m.name} — ₦{m.price_ngn}" for m in ACTIVE_BUSINESS.menu)
+def _parse_quantity_claude(message: str, quantity_unit: str) -> int | None:
     data = _call_tool(
         system=(
-            f"You are the ordering assistant for {ACTIVE_BUSINESS.display_name}. Menu:\n{menu_text}\n\n"
-            f"The customer has already chosen: {draft.get('item', '?')}. This system takes exactly "
-            "ONE item per order — you cannot add a second item to this order. If the customer asks "
-            "for something else or an additional item, politely explain that this order is for the "
-            "item already chosen, and they're welcome to place a separate order for anything else "
-            "once this one is done. Do not try to accommodate a second item.\n\n"
-            "Otherwise, given the customer's latest message, extract the quantity and/or delivery "
-            "address still needed. complete=true only once quantity>0 and delivery_address are both "
-            "filled. reply_text is a short, warm WhatsApp reply asking for whichever field is still "
-            "missing, or the polite redirect described above if they asked for something else. "
-            "Once complete=true, set reply_text to an empty string — a separate, fully-formatted "
-            "confirmation message (with the total price and payment link) is always sent "
-            "automatically right after; do not write your own confirmation summary, it would "
-            "arrive as a duplicate, second message."
+            f"The customer was asked how many {quantity_unit} they want of an item they already "
+            "chose. Extract that quantity as an integer. If the message doesn't contain a usable "
+            "quantity (e.g. it's off-topic), set found=false."
         ),
-        user_content=f"Current draft: {json.dumps(draft)}\nCustomer message: {message}",
-        tool_name="update_order_draft",
-        description="Record the updated order draft and the reply to send the customer.",
+        user_content=message,
+        tool_name="extract_quantity",
+        description="Record the extracted quantity.",
         input_schema={
             "type": "object",
             "properties": {
                 "quantity": {"type": "integer"},
-                "delivery_address": {"type": "string"},
-                "complete": {"type": "boolean"},
-                "reply_text": {"type": "string"},
+                "found": {"type": "boolean"},
             },
-            "required": ["quantity", "delivery_address", "complete", "reply_text"],
+            "required": ["quantity", "found"],
         },
     )
-    # Start from the FULL existing draft, not just the fields Claude manages
-    # — conversation.py stashes "category", "item", "_unit_price", and
-    # "_quantity_unit" on this same dict before ever delegating here, and a
-    # draft built from scratch would silently drop them, resetting the
-    # customer back to "pick a category" on their very next reply. Caught
-    # live: this exact bug reset a real conversation right after the address
-    # was captured, the very last field of the order.
-    new_draft = dict(draft)
-    new_draft["quantity"] = data.get("quantity", draft.get("quantity", 0))
-    new_draft["delivery_address"] = data.get("delivery_address", draft.get("delivery_address", ""))
-    return OrderParseResult(draft=new_draft, complete=bool(data.get("complete")), reply_text=data.get("reply_text", ""))
+    if not data.get("found"):
+        return None
+    qty = int(data.get("quantity", 0))
+    return qty if qty > 0 else None
 
 
-_QTY_RE = re.compile(r"(\d+)\s*(plate|piece|pcs|x)?", re.I)
+def _parse_quantity_rules(message: str) -> int | None:
+    m = _QTY_RE.search(message)
+    if m:
+        return int(m.group(1))
+    lowered = message.lower()
+    for word, n in _QTY_WORDS.items():
+        if re.search(rf"\b{word}\b", lowered):
+            return n
+    return None
 
 
-def _parse_order_turn_rules(message: str, draft: dict) -> OrderParseResult:
+# ---------------------------------------------------------------------------
+# Cart continuation — after adding an item, is the customer adding another
+# one, giving their delivery address, or just confirming they're done (which
+# is NOT itself an address — "checkout" must never get saved as one)?
+# ---------------------------------------------------------------------------
+
+_ADD_MORE_WORDS = re.compile(
+    r"\b(add|another item|one more|something else|also (get|want|need|order)|"
+    r"can i (also )?(get|have|add)|i (also )?(want|need))\b", re.I
+)
+
+# Deliberately word/phrase-based rather than a single bare "no" — a real
+# address can start with "No" ("No 5 Adeyemi Close", common Nigerian address
+# format), so a bare negation can't be treated as "no address given" here.
+_CONFIRM_DONE_RE = re.compile(
+    r"\b(checkout|check ?out|that'?s all|thats all|that'?s it|thats it|"
+    r"done|no more|nothing else|no thanks|nope)\b", re.I
+)
+
+
+@dataclass
+class CartContinuation:
+    wants_more: bool
+    category: str | None
+    has_address: bool  # only meaningful when wants_more is False
+
+
+def classify_cart_continuation(message: str, categories: list[str]) -> CartContinuation:
     """
-    Deterministic fallback: walks the same three fields (item, quantity,
-    address) ONE PER TURN. Good enough to run the scripted demo conversation
-    without any API key.
-
-    Important: each branch returns immediately after filling a field (except
-    the last one, which falls through to completion). Without that early
-    return, a message like "1" would satisfy both the item-number check AND
-    the quantity regex in the same turn, silently skipping the quantity
-    question — that was a real bug caught by the test suite before this fix.
+    Decides what to do with the customer's message sent right after an item
+    was added to the cart: add another item, treat this message as their
+    delivery address, or (has_address=False) they're confirming they're done
+    without actually having given an address yet — "checkout"/"that's all"
+    must prompt for the real address rather than being saved as one.
     """
-    draft = dict(draft)
-    menu_by_number = {m.number: m for m in ACTIVE_BUSINESS.menu}
+    if settings.anthropic_configured:
+        try:
+            return _classify_cart_continuation_claude(message, categories)
+        except Exception:
+            log.exception("Claude cart-continuation classification failed — falling back to rules")
+    return _classify_cart_continuation_rules(message, categories)
 
-    if not draft.get("item"):
-        chosen = menu_by_number.get(message.strip())
-        if chosen:
-            draft["item"] = chosen.name
-            draft["_unit_price"] = chosen.price_ngn
-            return OrderParseResult(draft=draft, complete=False, reply_text="Great choice 😋 How many plates?")
-        menu_lines = "\n".join(f"{m.number}️⃣ {m.name} — ₦{m.price_ngn}" for m in ACTIVE_BUSINESS.menu)
-        return OrderParseResult(draft=draft, complete=False,
-                                 reply_text=f"What would you like? Here's today's menu:\n{menu_lines}\n\nReply with a number.")
 
-    if not draft.get("quantity"):
-        m = _QTY_RE.search(message)
-        qty = int(m.group(1)) if m else None
-        if qty:
-            draft["quantity"] = qty
-            return OrderParseResult(draft=draft, complete=False, reply_text="What's the delivery address?")
-        unit = draft.get("_quantity_unit", "plates")
-        return OrderParseResult(draft=draft, complete=False, reply_text=f"How many {unit}?")
-
-    if not draft.get("delivery_address"):
-        if len(message.strip()) >= 4 and not message.strip().isdigit():
-            draft["delivery_address"] = message.strip()
-            # falls through to completion below — this is the field that
-            # finishes the order, so we don't ask another question first
-        else:
-            return OrderParseResult(draft=draft, complete=False, reply_text="What's the delivery address?")
-
-    total = draft.get("_unit_price", 0) * draft.get("quantity", 1)
-    reply = (
-        f"Got it — {draft['quantity']}x {draft['item']} = ₦{total:,}\n\n"
-        f"Delivering to: {draft['delivery_address']}"
+def _classify_cart_continuation_claude(message: str, categories: list[str]) -> CartContinuation:
+    data = _call_tool(
+        system=(
+            "The customer just added an item to their cart and was asked whether they'd like to "
+            f"add another item, or (if not) to give their delivery address. Categories available: "
+            f"{', '.join(categories)}. Decide: is this message asking to add another item "
+            "(wants_more=true)? If wants_more=true and the message mentions a category or item by "
+            "name, set category to that category's name exactly as given above; otherwise leave "
+            "category empty. If wants_more=false, decide has_address: true only if this message "
+            "itself actually contains a real delivery address or location — a plain confirmation "
+            "like 'checkout', 'that's all', or 'done' is NOT an address, so has_address must be "
+            "false for those (the customer will be asked for the real address next)."
+        ),
+        user_content=message,
+        tool_name="classify_cart_continuation",
+        description="Decide whether the customer wants to add another item, is giving their address, or is just confirming they're done.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "wants_more": {"type": "boolean"},
+                "category": {"type": "string"},
+                "has_address": {"type": "boolean"},
+            },
+            "required": ["wants_more", "category", "has_address"],
+        },
     )
-    return OrderParseResult(draft=draft, complete=True, reply_text=reply)
+    category = data.get("category") or None
+    if category not in categories:
+        category = None
+    return CartContinuation(
+        wants_more=bool(data.get("wants_more")),
+        category=category,
+        has_address=bool(data.get("has_address")),
+    )
+
+
+def _classify_cart_continuation_rules(message: str, categories: list[str]) -> CartContinuation:
+    stripped = message.strip()
+    matched = next((c for c in categories if c.lower() == stripped.lower()), None)
+    if matched:
+        return CartContinuation(True, matched, False)
+    if _ADD_MORE_WORDS.search(message):
+        lowered = message.lower()
+        mentioned_category = next((c for c in categories if c.lower() in lowered), None)
+        if mentioned_category:
+            return CartContinuation(True, mentioned_category, False)
+        # No category named directly, but the message might name an item
+        # instead ("can I also get a Coca-Cola") — resolve that to its
+        # category so the customer isn't asked to pick a category they
+        # already effectively answered.
+        mentioned_item_category = next(
+            (m.category for m in ACTIVE_BUSINESS.menu if m.name.lower() in lowered), None
+        )
+        return CartContinuation(True, mentioned_item_category, False)
+    if _CONFIRM_DONE_RE.search(message):
+        return CartContinuation(False, None, False)
+    return CartContinuation(False, None, True)
 
 
 # ---------------------------------------------------------------------------

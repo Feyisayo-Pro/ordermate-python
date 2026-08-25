@@ -50,8 +50,24 @@
                     {{ order.customer.name or "—" }}<br>
                     <span class="phone">{{ order.customer.phone }}</span>
                 </td>
-                <td>{{ order.item }}</td>
-                <td>{{ order.quantity }}</td>
+                <td>
+                    {% if order.items %}
+                        {% for line in order.items %}
+                            {{ line.item }}{% if not loop.last %}<br>{% endif %}
+                        {% endfor %}
+                    {% else %}
+                        {{ order.item }}
+                    {% endif %}
+                </td>
+                <td>
+                    {% if order.items %}
+                        {% for line in order.items %}
+                            {{ line.quantity }}{% if not loop.last %}<br>{% endif %}
+                        {% endfor %}
+                    {% else %}
+                        {{ order.quantity }}
+                    {% endif %}
+                </td>
                 <td>₦{{ "{:,}".format(order.total_ngn) }}</td>
                 <td>{{ order.delivery_address }}</td>
                 <td><span class="badge badge-{{ order.status.replace(' ', '-') }}">{{ order.status }}</span></td>

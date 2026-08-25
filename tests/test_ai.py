@@ -3,7 +3,7 @@ Unit tests for the rule-based fallback in app/ai.py (no ANTHROPIC_API_KEY set
 in tests, so classify_intent always exercises _classify_intent_rules).
 """
 from app import ai
-from app.ai import classify_intent, parse_order_turn, transcribe_voice_note
+from app.ai import classify_cart_continuation, classify_intent, parse_quantity, transcribe_voice_note
 from app.config import get_settings
 
 
@@ -60,76 +60,88 @@ def test_transcribe_voice_note_returns_none_without_deepgram_configured():
     assert transcribe_voice_note(b"fake audio bytes") is None
 
 
-def test_parse_order_turn_claude_preserves_fields_it_does_not_manage(monkeypatch):
-    # Regression: caught live — the Claude path built its returned draft from
-    # scratch with only item/quantity/delivery_address, silently dropping
-    # "category", "_unit_price", and "_quantity_unit" that conversation.py
-    # stashes on this same dict. Since that draft *replaces* the stored one,
-    # this reset a real conversation back to "pick a category" immediately
-    # after the customer supplied the delivery address — the very last field
-    # of the order.
+def test_parse_quantity_rules_extracts_a_digit():
+    assert parse_quantity("2 plates please", "plates") == 2
+
+
+def test_parse_quantity_rules_extracts_a_number_word():
+    assert parse_quantity("just one", "plates") == 1
+    assert parse_quantity("two please", "bottles") == 2
+
+
+def test_parse_quantity_rules_returns_none_when_unclear():
+    assert parse_quantity("hmm not sure", "plates") is None
+
+
+def test_parse_quantity_claude_only_reads_the_quantity_field(monkeypatch):
+    # Scoped narrowly on purpose: quantity extraction used to be bundled
+    # together with delivery_address AND (further back) the item itself in
+    # one combined Claude call — that's exactly what let Claude "helpfully"
+    # rewrite fields it had no business touching (see git history for the
+    # multi-item corruption bug this caused). Each field gets its own call now.
+    settings = get_settings()
+    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(ai, "_call_tool", lambda **kwargs: {"quantity": 3, "found": True})
+    assert parse_quantity("three please", "plates") == 3
+
+
+def test_parse_quantity_claude_returns_none_when_not_found(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "fake-key-for-test")
+    monkeypatch.setattr(ai, "_call_tool", lambda **kwargs: {"quantity": 0, "found": False})
+    assert parse_quantity("what's on the menu again?", "plates") is None
+
+
+def test_classify_cart_continuation_rules_recognizes_a_category_name():
+    # Regression scenario, now a supported feature rather than rejected:
+    # caught live, a customer asked for a second item ("Drinks") mid-order —
+    # this used to get crammed into the (single) item field, silently
+    # undercharging. Real carts now support exactly this.
+    decision = classify_cart_continuation("Drinks", ["Mains", "Drinks"])
+    assert decision.wants_more is True
+    assert decision.category == "Drinks"
+
+
+def test_classify_cart_continuation_rules_recognizes_add_more_phrasing():
+    decision = classify_cart_continuation("Can I also get a Coca-Cola", ["Mains", "Drinks"])
+    assert decision.wants_more is True
+
+
+def test_classify_cart_continuation_rules_treats_an_address_as_not_wanting_more():
+    decision = classify_cart_continuation("14 Adeyemi Street, Ikorodu", ["Mains", "Drinks"])
+    assert decision.wants_more is False
+    assert decision.category is None
+    assert decision.has_address is True
+
+
+def test_classify_cart_continuation_rules_does_not_treat_checkout_as_an_address():
+    # Regression guard: "checkout"/"that's all" confirms the customer is done
+    # adding items, but it is NOT itself a delivery address — must not be
+    # silently accepted as one.
+    for phrase in ["checkout", "that's all", "that's all thanks", "done", "no more", "nope"]:
+        decision = classify_cart_continuation(phrase, ["Mains", "Drinks"])
+        assert decision.wants_more is False
+        assert decision.has_address is False, f"{phrase!r} should not be treated as an address"
+
+
+def test_classify_cart_continuation_rules_allows_addresses_starting_with_no():
+    # A real Nigerian address commonly starts with "No" ("No 5 Adeyemi
+    # Close") — must not be mistaken for a bare "no" confirmation.
+    decision = classify_cart_continuation("No 5 Adeyemi Close, Ikeja", ["Mains", "Drinks"])
+    assert decision.wants_more is False
+    assert decision.has_address is True
+
+
+def test_classify_cart_continuation_claude_ignores_a_hallucinated_category(monkeypatch):
+    # Defensive: even if Claude names a category that doesn't exist on this
+    # business's menu, the caller must never end up with a category to look
+    # items up against that isn't real.
     settings = get_settings()
     monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "fake-key-for-test")
     monkeypatch.setattr(
-        ai,
-        "_call_tool",
-        lambda **kwargs: {
-            "item": "Ofada + Beef",
-            "quantity": 3,
-            "delivery_address": "3 Awise Ogundare lane",
-            "complete": True,
-            "reply_text": "All set!",
-        },
+        ai, "_call_tool",
+        lambda **kwargs: {"wants_more": True, "category": "Desserts", "has_address": False},
     )
-
-    existing_draft = {
-        "category": "Mains",
-        "item": "Ofada + Beef",
-        "_unit_price": 4500,
-        "_quantity_unit": "plates",
-        "quantity": 0,
-        "delivery_address": "",
-    }
-    result = parse_order_turn("3 Awise Ogundare lane", existing_draft)
-
-    assert result.draft["category"] == "Mains"
-    assert result.draft["_unit_price"] == 4500
-    assert result.draft["_quantity_unit"] == "plates"
-    assert result.draft["delivery_address"] == "3 Awise Ogundare lane"
-    assert result.complete is True
-
-
-def test_parse_order_turn_claude_cannot_change_the_item(monkeypatch):
-    # Regression: caught live — "item" used to be a Claude-writable field.
-    # When a customer asked for a second item mid-flow ("Drinks"), Claude
-    # "helpfully" crammed both into the item string ("Ofada + Beef,
-    # Coca-Cola") — but pricing (_unit_price * quantity) only ever reflected
-    # the original item, so the order silently undercharged for the second
-    # one. "item" is no longer in Claude's tool schema at all; this locks in
-    # that it's structurally impossible for Claude's response to change it,
-    # regardless of what a mocked (or real) response might contain.
-    settings = get_settings()
-    monkeypatch.setattr(settings, "ANTHROPIC_API_KEY", "fake-key-for-test")
-    monkeypatch.setattr(
-        ai,
-        "_call_tool",
-        lambda **kwargs: {
-            "quantity": 3,
-            "delivery_address": "",
-            "complete": False,
-            "reply_text": "This order is for the Ofada + Beef you've already chosen.",
-        },
-    )
-
-    existing_draft = {
-        "category": "Mains",
-        "item": "Ofada + Beef",
-        "_unit_price": 4500,
-        "_quantity_unit": "plates",
-        "quantity": 3,
-        "delivery_address": "",
-    }
-    result = parse_order_turn("Can I also get a Coca-Cola", existing_draft)
-
-    assert result.draft["item"] == "Ofada + Beef"
-    assert result.draft["_unit_price"] == 4500
+    decision = classify_cart_continuation("something sweet too", ["Mains", "Drinks"])
+    assert decision.wants_more is True
+    assert decision.category is None

@@ -181,6 +181,87 @@ def test_starting_a_new_order_after_cancelling_works_cleanly(client, db_session)
     assert customer.conversation.state == "idle"
 
 
+def test_adding_a_second_item_by_naming_its_category_builds_a_real_cart(client, db_session):
+    # The actual live-reported scenario this feature was built for: a customer
+    # asks for a second item mid-order. Previously this got crammed into the
+    # single item field and silently undercharged (see git history); now it's
+    # a real second line item with its own correct pricing.
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "1")          # Jollof Rice + Chicken, ₦3,500
+    _send(client, "1")          # qty 1 -> "Got it... What's the delivery address? (or add another)"
+    _send(client, "Drinks")     # naming the category = add another item
+    _send(client, "5")          # Coca-Cola, ₦500
+    _send(client, "2")          # qty 2
+    resp = _send(client, "14 Adeyemi Street, Ikorodu")
+    assert resp.status_code == 200
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    order = db_session.query(models.Order).filter_by(customer_id=customer.id).one()
+
+    assert len(order.items) == 2
+    assert order.items[0].item == "Jollof Rice + Chicken"
+    assert order.items[0].subtotal_ngn == 3500
+    assert order.items[1].item == "Coca-Cola"
+    assert order.items[1].quantity == 2
+    assert order.items[1].subtotal_ngn == 1000
+    assert order.total_ngn == 4500  # 3500 + (2 x 500) — not silently undercharged
+    assert order.delivery_address == "14 Adeyemi Street, Ikorodu"
+    assert customer.conversation.state == "idle"
+
+
+def test_asking_for_a_second_item_in_natural_language_also_builds_a_cart(client, db_session):
+    # Caught live, the exact phrase: "Can I also get a Coca-Cola" — should now
+    # be recognized as wanting to add another item, not politely rejected.
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "1")
+    _send(client, "1")
+    _send(client, "Can I also get a Coca-Cola")
+    _send(client, "5")
+    _send(client, "1")
+    _send(client, "Yaba, Lagos")
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    order = db_session.query(models.Order).filter_by(customer_id=customer.id).one()
+    assert len(order.items) == 2
+    assert order.total_ngn == 4000  # 3500 + 500
+
+
+def test_saying_checkout_after_adding_an_item_asks_for_address_instead_of_saving_it_as_one(client, db_session, caplog):
+    # Regression guard: "checkout" (or "that's all", "done", etc.) is a
+    # confirmation that the customer is done adding items — it must not be
+    # silently saved as the literal delivery address.
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "1")
+    with caplog.at_level(logging.INFO):
+        _send(client, "1")
+        resp = _send(client, "checkout")
+    assert resp.status_code == 200
+    assert any("What's the delivery address?" in r.message for r in caplog.records)
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    assert len(customer.orders) == 0  # not yet completed — still waiting on the real address
+
+    _send(client, "12 Marina Road")
+    db_session.refresh(customer)
+    order = customer.orders[0]
+    assert order.delivery_address == "12 Marina Road"
+
+
+def test_single_item_order_still_shows_the_original_confirmation_shape(client, caplog):
+    # A single-item cart shouldn't read any differently than before this
+    # feature existed — no "cart" language for the common case.
+    with caplog.at_level(logging.INFO):
+        _send(client, "order")
+        _send(client, "Mains")
+        _send(client, "1")
+        _send(client, "1")
+        _send(client, "Yaba, Lagos")
+    assert any("Order #A-" in r.message and "confirmed" in r.message for r in caplog.records)
+
+
 def test_ordinal_suffixes():
     assert _ordinal(1) == "1st"
     assert _ordinal(2) == "2nd"

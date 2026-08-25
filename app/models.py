@@ -53,6 +53,15 @@ class Conversation(Base):
 
 
 class Order(Base):
+    """
+    item/quantity are kept as a denormalized summary (not the source of truth
+    once OrderItem exists) so every pre-cart-feature row already in production
+    keeps displaying correctly with zero migration: for a single-item order
+    they hold the exact item name/quantity (unchanged from before carts
+    existed); for a real multi-item cart they hold a joined summary string
+    and the total item count. OrderItem below is the real per-line-item data
+    for anything that needs to price or display a cart accurately.
+    """
     __tablename__ = "orders"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -68,6 +77,22 @@ class Order(Base):
 
     customer: Mapped["Customer"] = relationship(back_populates="orders")
     feedback: Mapped["Feedback"] = relationship(back_populates="order", uselist=False)
+    items: Mapped[list["OrderItem"]] = relationship(back_populates="order", order_by="OrderItem.id")
+
+
+class OrderItem(Base):
+    """One line item within an Order's cart — see Order's docstring."""
+    __tablename__ = "order_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"))
+    item: Mapped[str] = mapped_column(String(200))
+    quantity: Mapped[int] = mapped_column(Integer, default=1)
+    quantity_unit: Mapped[str] = mapped_column(String(32), default="plates")
+    unit_price_ngn: Mapped[int] = mapped_column(Integer, default=0)
+    subtotal_ngn: Mapped[int] = mapped_column(Integer, default=0)
+
+    order: Mapped["Order"] = relationship(back_populates="items")
 
 
 class Feedback(Base):
