@@ -1,3 +1,6 @@
+import atexit
+import os
+import tempfile
 import time
 
 # pyrefly: ignore [missing-import]
@@ -16,10 +19,28 @@ from app.database import Base, get_db
 from app.main import app
 from app.config import get_settings
 
+# A real temp file on disk (not :memory:) deliberately — the webhook's own
+# request thread and the scheduler's background thread (see conftest.py's
+# _warm_up_scheduler and app/scheduler.py) both need to see and write the
+# SAME data, genuinely concurrently, and neither of SQLite's two in-memory
+# options handled that safely here: a StaticPool shares ONE physical
+# connection object across both threads, which caused real (if
+# intermittent) StaleDataError/"transaction in progress" failures under
+# concurrent use (e.g. a test setting ABANDONED_ORDER_NUDGE_SECONDS to 0 so
+# the background job fires almost immediately); shared-cache in-memory mode
+# with a normal multi-connection pool avoided that but crashed the whole
+# process (a real segfault, not just a test failure) under this exact
+# dependency combination. A plain file-backed database lets SQLite use its
+# own long-proven file-locking for concurrent access instead of either of
+# those, at the cost of a bit of disk I/O — irrelevant for a test suite this
+# size. Removed at process exit; safe to leave behind if that doesn't run.
+_TEST_DB_FD, _TEST_DB_PATH = tempfile.mkstemp(suffix=".db", prefix="ordermate_test_")
+os.close(_TEST_DB_FD)
+atexit.register(lambda: os.path.exists(_TEST_DB_PATH) and os.remove(_TEST_DB_PATH))
+
 TEST_ENGINE = create_engine(
-    "sqlite:///:memory:",
+    f"sqlite:///{_TEST_DB_PATH}",
     connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
 )
 TestingSessionLocal = sessionmaker(bind=TEST_ENGINE, autoflush=False, autocommit=False)
 
@@ -68,6 +89,18 @@ def _warm_up_scheduler():
 @pytest.fixture(autouse=True)
 def _reset_db():
     Base.metadata.create_all(bind=TEST_ENGINE)
+    # Every test gets a completely fresh schema (drop_all below), so the two
+    # demo businesses this app now serves (see app/businesses.py) need
+    # re-seeding every time too — production does this once via init_db() at
+    # startup, but tests never call that unless they go through the `client`
+    # fixture, and even then it'd only run once per process while the schema
+    # itself gets wiped per-test.
+    from app.businesses import seed_businesses
+    session = TestingSessionLocal()
+    try:
+        seed_businesses(session)
+    finally:
+        session.close()
     yield
     Base.metadata.drop_all(bind=TEST_ENGINE)
 
@@ -203,6 +236,15 @@ def db_session():
     session = TestingSessionLocal()
     yield session
     session.close()
+
+
+@pytest.fixture
+def default_business(db_session):
+    """The seeded Mama's Kitchen business (see app/businesses.py) — for tests
+    that build Customer/Order/etc. rows directly and need a real business_id,
+    rather than going through the webhook (which resolves this itself)."""
+    from app import models
+    return db_session.query(models.Business).filter_by(is_default=True).one()
 
 
 def whatsapp_payload(phone: str, name: str, text: str) -> dict:

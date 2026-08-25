@@ -28,6 +28,8 @@
     <p>
         <a class="nav" href="/admin/orders">&larr; Orders dashboard</a>
         &nbsp;·&nbsp;
+        <a class="nav" href="/admin/appointments">Appointments</a>
+        &nbsp;·&nbsp;
         <a class="nav" href="/admin/templates">Manage templates &rarr;</a>
     </p>
     <h1>📣 Broadcast a message</h1>
@@ -44,6 +46,15 @@
     <div class="card">
         <form method="post" action="/admin/broadcast/preview">
             <div class="field">
+                <label for="business_id">Business</label>
+                <select name="business_id" id="business_id" onchange="toggleBusiness()">
+                    {% for b in businesses %}
+                    <option value="{{ b.id }}">{{ b.display_name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div class="field">
                 <label for="audience">Send to</label>
                 <select name="audience" id="audience">
                     {% for key, label in audiences.items() %}
@@ -54,19 +65,23 @@
 
             <div class="field">
                 <label>Method</label>
-                <div class="method-option">
-                    <input type="radio" name="method" value="text" id="method-text" checked onchange="toggleMethod()">
-                    <label for="method-text">Free text (only reaches customers active in the last 24h)</label>
-                </div>
-                {% for t in approved_templates %}
-                <div class="method-option">
-                    <input type="radio" name="method" value="template:{{ t.id }}" id="method-{{ t.id }}" onchange="toggleMethod()">
-                    <label for="method-{{ t.id }}">Template: {{ t.name }} (reaches everyone)</label>
+                {% for b in businesses %}
+                <div class="business-methods" data-business="{{ b.id }}" style="{% if not loop.first %}display:none;{% endif %}">
+                    <div class="method-option">
+                        <input type="radio" name="method_{{ b.id }}" value="text" id="method-text-{{ b.id }}" {% if loop.first %}checked{% endif %} onchange="toggleMethod({{ b.id }})">
+                        <label for="method-text-{{ b.id }}">Free text (only reaches customers active in the last 24h)</label>
+                    </div>
+                    {% for t in approved_templates_by_business.get(b.id, []) %}
+                    <div class="method-option">
+                        <input type="radio" name="method_{{ b.id }}" value="template:{{ t.id }}" id="method-{{ t.id }}" onchange="toggleMethod({{ b.id }})">
+                        <label for="method-{{ t.id }}">Template: {{ t.name }} (reaches everyone)</label>
+                    </div>
+                    {% endfor %}
+                    {% if not approved_templates_by_business.get(b.id) %}
+                    <p class="hint">No approved templates yet for {{ b.display_name }} — <a href="/admin/templates">create and submit one</a> to reach customers outside the 24h window.</p>
+                    {% endif %}
                 </div>
                 {% endfor %}
-                {% if not approved_templates %}
-                <p class="hint">No approved templates yet — <a href="/admin/templates">create and submit one</a> to reach customers outside the 24h window.</p>
-                {% endif %}
             </div>
 
             <div class="field" id="message-field">
@@ -74,18 +89,32 @@
                 <textarea name="message" id="message" placeholder="e.g. We're open again today from 10am — same menu, same number 🍲"></textarea>
             </div>
 
+            <input type="hidden" name="method" id="method-hidden" value="text">
             <button type="submit">Preview</button>
         </form>
     </div>
 
     <script>
-        function toggleMethod() {
-            const isText = document.getElementById('method-text').checked;
-            const field = document.getElementById('message-field');
-            const textarea = document.getElementById('message');
-            field.style.display = isText ? 'block' : 'none';
-            textarea.required = isText;
+        function currentBusinessId() {
+            return document.getElementById('business_id').value;
         }
+        function toggleBusiness() {
+            const id = currentBusinessId();
+            document.querySelectorAll('.business-methods').forEach(function (el) {
+                el.style.display = (el.getAttribute('data-business') === id) ? 'block' : 'none';
+            });
+            toggleMethod(id);
+        }
+        function toggleMethod(businessId) {
+            const id = businessId || currentBusinessId();
+            const checked = document.querySelector('input[name="method_' + id + '"]:checked');
+            const value = checked ? checked.value : 'text';
+            document.getElementById('method-hidden').value = value;
+            const isText = value === 'text';
+            document.getElementById('message-field').style.display = isText ? 'block' : 'none';
+            document.getElementById('message').required = isText;
+        }
+        toggleMethod(currentBusinessId());
     </script>
 </body>
 </html>

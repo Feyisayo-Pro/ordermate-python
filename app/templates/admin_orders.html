@@ -26,12 +26,17 @@
     </style>
 </head>
 <body>
-    <p><a href="/admin/broadcast" style="color: #444; font-size: 0.85rem; text-decoration: none;">📣 Broadcast a message &rarr;</a></p>
+    <p>
+        <a href="/admin/appointments" style="color: #444; font-size: 0.85rem; text-decoration: none;">💇 Appointments</a>
+        &nbsp;·&nbsp;
+        <a href="/admin/broadcast" style="color: #444; font-size: 0.85rem; text-decoration: none;">📣 Broadcast a message &rarr;</a>
+    </p>
     <h1>🍲 Orders</h1>
     <p class="sub">Most recent 100 orders. Update status and click Update to save.</p>
     <table>
         <thead>
             <tr>
+                <th>Business</th>
                 <th>Ref</th>
                 <th>Customer</th>
                 <th>Item</th>
@@ -46,6 +51,7 @@
         <tbody>
         {% for order in orders %}
             <tr>
+                <td>{{ order.business.display_name }}</td>
                 <td><strong>{{ order.order_ref }}</strong></td>
                 <td>
                     {{ order.customer.name or "—" }}<br>
@@ -85,7 +91,7 @@
                 </td>
             </tr>
         {% else %}
-            <tr><td colspan="9" class="empty">No orders yet.</td></tr>
+            <tr><td colspan="10" class="empty">No orders yet.</td></tr>
         {% endfor %}
         </tbody>
     </table>

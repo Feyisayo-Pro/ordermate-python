@@ -681,10 +681,16 @@ def test_completing_an_order_cancels_the_abandonment_nudge(client, db_session):
 def test_abandonment_nudge_fires_when_customer_goes_quiet_mid_order(client, db_session, caplog):
     # The autouse fixture uses a 2s default (see conftest.py) so the "still pending"
     # tests above aren't racy — here we actually want the job to fire, so override
-    # to near-zero just for this test.
+    # to near-zero just for this test. Deliberately NOT literally 0: the job gets
+    # scheduled mid-request, before that same request's own db.commit() lands (see
+    # conversation.py's _continue_order) — a genuinely 0-second delay let the
+    # background thread occasionally win that race and read the pre-commit
+    # ("idle") state, silently no-op'ing. A small real delay reliably leaves
+    # enough headroom for the commit (a single fast local write) to land first,
+    # while still being far under wait_until's timeout.
     settings = get_settings()
     original = settings.ABANDONED_ORDER_NUDGE_SECONDS
-    settings.ABANDONED_ORDER_NUDGE_SECONDS = 0
+    settings.ABANDONED_ORDER_NUDGE_SECONDS = 0.2
     try:
         with caplog.at_level(logging.INFO):
             _send(client, "order")  # shows menu, state=ordering
@@ -698,13 +704,13 @@ def test_abandonment_nudge_fires_when_customer_goes_quiet_mid_order(client, db_s
     assert customer.conversation.state == "ordering"
 
 
-def test_send_abandoned_order_nudge_is_noop_if_state_already_changed(db_session, caplog):
+def test_send_abandoned_order_nudge_is_noop_if_state_already_changed(db_session, default_business, caplog):
     # Guards against the case where cancel_abandoned_order_nudge() didn't manage to
     # remove the job in time (e.g. it was already mid-execution) — the job itself
     # must re-check state rather than trusting it's still valid to fire.
     from app.conversation import send_abandoned_order_nudge
 
-    customer = models.Customer(phone=PHONE, name=NAME)
+    customer = models.Customer(phone=PHONE, name=NAME, business=default_business)
     db_session.add(customer)
     db_session.flush()
     db_session.add(models.Conversation(customer_id=customer.id, state="idle", draft_order="{}"))
@@ -716,7 +722,7 @@ def test_send_abandoned_order_nudge_is_noop_if_state_already_changed(db_session,
     assert not any("Still with us?" in r.message for r in caplog.records)
 
 
-def test_send_abandoned_order_nudge_is_noop_if_customer_replied_recently(db_session, caplog):
+def test_send_abandoned_order_nudge_is_noop_if_customer_replied_recently(db_session, default_business, caplog):
     # Regression test for a real bug: state=="ordering" alone isn't enough to
     # decide a nudge is warranted — if the customer replied moments ago (this
     # firing raced an in-flight reschedule), sending "still with us?" mid
@@ -726,7 +732,7 @@ def test_send_abandoned_order_nudge_is_noop_if_customer_replied_recently(db_sess
     from app.conversation import send_abandoned_order_nudge
 
     settings = get_settings()
-    customer = models.Customer(phone=PHONE, name=NAME)
+    customer = models.Customer(phone=PHONE, name=NAME, business=default_business)
     db_session.add(customer)
     db_session.flush()
     convo = models.Conversation(customer_id=customer.id, state="ordering", draft_order="{}")
@@ -741,13 +747,13 @@ def test_send_abandoned_order_nudge_is_noop_if_customer_replied_recently(db_sess
     assert not any("Still with us?" in r.message for r in caplog.records)
 
 
-def test_send_abandoned_order_nudge_fires_when_genuinely_quiet_long_enough(db_session, caplog):
+def test_send_abandoned_order_nudge_fires_when_genuinely_quiet_long_enough(db_session, default_business, caplog):
     from datetime import datetime, timedelta, timezone
 
     from app.conversation import send_abandoned_order_nudge
 
     settings = get_settings()
-    customer = models.Customer(phone=PHONE, name=NAME)
+    customer = models.Customer(phone=PHONE, name=NAME, business=default_business)
     db_session.add(customer)
     db_session.flush()
     convo = models.Conversation(customer_id=customer.id, state="ordering", draft_order="{}")

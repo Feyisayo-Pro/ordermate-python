@@ -24,7 +24,6 @@ from dataclasses import dataclass
 # pyrefly: ignore [missing-import]
 import httpx
 
-from app.business_config import ACTIVE_BUSINESS
 from app.config import get_settings
 
 log = logging.getLogger("ordermate.ai")
@@ -238,20 +237,25 @@ class CartContinuation:
     has_address: bool  # only meaningful when wants_more is False
 
 
-def classify_cart_continuation(message: str, categories: list[str]) -> CartContinuation:
+def classify_cart_continuation(message: str, categories: list[str], item_categories: dict[str, str] | None = None) -> CartContinuation:
     """
     Decides what to do with the customer's message sent right after an item
     was added to the cart: add another item, treat this message as their
     delivery address, or (has_address=False) they're confirming they're done
     without actually having given an address yet — "checkout"/"that's all"
     must prompt for the real address rather than being saved as one.
+
+    item_categories (lowercased item name -> category) is only used by the
+    rules fallback, to resolve a mentioned item ("can I also get a
+    Coca-Cola") to its category — the caller's business-specific menu, not a
+    hardcoded one, since this app now serves more than one business's menu.
     """
     if settings.anthropic_configured:
         try:
             return _classify_cart_continuation_claude(message, categories)
         except Exception:
             log.exception("Claude cart-continuation classification failed — falling back to rules")
-    return _classify_cart_continuation_rules(message, categories)
+    return _classify_cart_continuation_rules(message, categories, item_categories or {})
 
 
 def _classify_cart_continuation_claude(message: str, categories: list[str]) -> CartContinuation:
@@ -290,7 +294,7 @@ def _classify_cart_continuation_claude(message: str, categories: list[str]) -> C
     )
 
 
-def _classify_cart_continuation_rules(message: str, categories: list[str]) -> CartContinuation:
+def _classify_cart_continuation_rules(message: str, categories: list[str], item_categories: dict[str, str]) -> CartContinuation:
     stripped = message.strip()
     matched = next((c for c in categories if c.lower() == stripped.lower()), None)
     if matched:
@@ -305,7 +309,7 @@ def _classify_cart_continuation_rules(message: str, categories: list[str]) -> Ca
         # category so the customer isn't asked to pick a category they
         # already effectively answered.
         mentioned_item_category = next(
-            (m.category for m in ACTIVE_BUSINESS.menu if m.name.lower() in lowered), None
+            (cat for name, cat in item_categories.items() if name in lowered), None
         )
         return CartContinuation(True, mentioned_item_category, False)
     if _CONFIRM_DONE_RE.search(message):

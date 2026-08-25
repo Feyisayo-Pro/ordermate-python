@@ -39,32 +39,77 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     _add_missing_columns()
 
+    # Multi-tenancy landed after this app already had real production data
+    # under one implicit business — every pre-existing customers/orders/
+    # message_templates row needs a business_id, and there's nothing to
+    # backfill it FROM until the businesses themselves exist, so seeding runs
+    # before the backfill step below.
+    from app.businesses import seed_businesses, get_default_business
+    db = SessionLocal()
+    try:
+        seed_businesses(db)
+        default_business = get_default_business(db)
+        _backfill_business_ids(default_business.id)
+    finally:
+        db.close()
+
 
 def _add_missing_columns():
     """
     create_all() only creates missing TABLES — it never alters a table that
     already exists, so adding a new column to an existing model (as opposed
-    to a whole new table like OrderItem) needs its own handling here. There's
-    no migration framework in this project (deliberately, for a single-
-    business MVP — see models.py's own docstring), so this does the smallest
-    thing that's actually safe: inspect what columns really exist in the
-    live database and ALTER TABLE for exactly the ones missing. A no-op on a
+    to a whole new table like OrderItem/Business) needs its own handling
+    here. There's no migration framework in this project (deliberately, for
+    an MVP — see models.py's own docstring), so this does the smallest thing
+    that's actually safe: inspect what columns really exist in the live
+    database and ALTER TABLE for exactly the ones missing. A no-op on a
     fresh database, since create_all() already created every current column.
+
+    business_id is deliberately added WITHOUT a NOT NULL constraint (even
+    though the model treats it as always-present) — enforcing NOT NULL on an
+    existing live table needs a constraint change this app has no safe way
+    to make without a real migration framework; the one-time backfill in
+    init_db() below achieves the same practical result without it.
     """
     # pyrefly: ignore [missing-import]
     from sqlalchemy import inspect, text
 
     inspector = inspect(engine)
-    if "customers" not in inspector.get_table_names():
-        return
-    existing = {c["name"] for c in inspector.get_columns("customers")}
     statements = []
-    if "last_inbound_at" not in existing:
-        statements.append("ALTER TABLE customers ADD COLUMN last_inbound_at TIMESTAMP")
-    if "opted_out" not in existing:
-        statements.append("ALTER TABLE customers ADD COLUMN opted_out BOOLEAN DEFAULT FALSE")
+
+    if "customers" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("customers")}
+        if "last_inbound_at" not in existing:
+            statements.append("ALTER TABLE customers ADD COLUMN last_inbound_at TIMESTAMP")
+        if "opted_out" not in existing:
+            statements.append("ALTER TABLE customers ADD COLUMN opted_out BOOLEAN DEFAULT FALSE")
+        if "business_id" not in existing:
+            statements.append("ALTER TABLE customers ADD COLUMN business_id INTEGER")
+
+    if "orders" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("orders")}
+        if "business_id" not in existing:
+            statements.append("ALTER TABLE orders ADD COLUMN business_id INTEGER")
+
+    if "message_templates" in inspector.get_table_names():
+        existing = {c["name"] for c in inspector.get_columns("message_templates")}
+        if "business_id" not in existing:
+            statements.append("ALTER TABLE message_templates ADD COLUMN business_id INTEGER")
+
     if not statements:
         return
     with engine.begin() as conn:
         for stmt in statements:
             conn.execute(text(stmt))
+
+
+def _backfill_business_ids(default_business_id: int):
+    """Every customers/orders/message_templates row that predates multi-tenancy
+    belongs to the one business that existed before it — the seeded default."""
+    # pyrefly: ignore [missing-import]
+    from sqlalchemy import text
+
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE customers SET business_id = :id WHERE business_id IS NULL"), {"id": default_business_id})
+        conn.execute(text("UPDATE orders SET business_id = :id WHERE business_id IS NULL"), {"id": default_business_id})
+        conn.execute(text("UPDATE message_templates SET business_id = :id WHERE business_id IS NULL"), {"id": default_business_id})

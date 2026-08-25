@@ -24,7 +24,7 @@
 <body>
     <h1>Confirm broadcast</h1>
     <p class="sub">
-        Sending to: {{ audience_label }}
+        {{ business_name }} &middot; Sending to: {{ audience_label }}
         {% if template_name %}&middot; via approved template <strong>{{ template_name }}</strong>{% endif %}
     </p>
 
@@ -38,6 +38,7 @@
         </div>
         <div class="actions">
             <form method="post" action="/admin/broadcast/send">
+                <input type="hidden" name="business_id" value="{{ business_id }}">
                 <input type="hidden" name="method" value="{{ method }}">
                 <input type="hidden" name="message" value="{{ message }}">
                 <input type="hidden" name="audience" value="{{ audience }}">

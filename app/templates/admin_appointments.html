@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OrderMate — Appointments</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; background: #f6f6f4; color: #222; }
+        h1 { margin-bottom: 0.25rem; }
+        p.sub { color: #666; margin-top: 0; margin-bottom: 1.5rem; }
+        a.nav { color: #444; font-size: 0.85rem; text-decoration: none; }
+        a.nav:hover { text-decoration: underline; }
+        table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-radius: 6px; overflow: hidden; }
+        th, td { text-align: left; padding: 0.65rem 0.9rem; border-bottom: 1px solid #eee; font-size: 0.88rem; vertical-align: top; }
+        th { background: #fafafa; font-weight: 600; color: #444; }
+        tr:last-child td { border-bottom: none; }
+        .phone { color: #888; font-size: 0.8rem; }
+        .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 10px; font-size: 0.78rem; font-weight: 600; }
+        .badge-Confirmed { background: #fff3cd; color: #7a5c00; }
+        .badge-Cancelled { background: #fde0e0; color: #a02020; }
+        .badge-Completed { background: #d4f4e2; color: #0f6b3f; }
+        .empty { padding: 2rem; text-align: center; color: #888; }
+    </style>
+</head>
+<body>
+    <p>
+        <a class="nav" href="/admin/orders">🍲 Orders</a>
+        &nbsp;·&nbsp;
+        <a class="nav" href="/admin/broadcast">📣 Broadcast a message &rarr;</a>
+    </p>
+    <h1>💇 Appointments</h1>
+    <p class="sub">Most recent 100 bookings, across every business.</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Business</th>
+                <th>Ref</th>
+                <th>Customer</th>
+                <th>Service</th>
+                <th>Price</th>
+                <th>When</th>
+                <th>Status</th>
+                <th>Booked</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for appt in appointments %}
+            <tr>
+                <td>{{ appt.business.display_name }}</td>
+                <td><strong>{{ appt.booking_ref }}</strong></td>
+                <td>
+                    {{ appt.customer.name or "—" }}<br>
+                    <span class="phone">{{ appt.customer.phone }}</span>
+                </td>
+                <td>{{ appt.service_name }}</td>
+                <td>₦{{ "{:,}".format(appt.price_ngn) }}</td>
+                <td>{{ appt.slot_at.strftime("%a %b %d, %I:%M %p") }}</td>
+                <td><span class="badge badge-{{ appt.status }}">{{ appt.status }}</span></td>
+                <td>{{ appt.created_at.strftime("%b %d, %H:%M") }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="8" class="empty">No appointments yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>

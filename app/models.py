@@ -1,10 +1,15 @@
 """
 Database models.
 
-Deliberately small: Customer, Conversation (tracks where a customer is mid-flow),
-Order, and Feedback. No auth/tenant tables — this is the single-business MVP
-scope. If you later need multi-tenant, add a `business_slug` column to each
-table and a Business table; the query patterns below don't have to change much.
+Multi-tenant: every business (Business row) is a separate demo/tenant sharing
+this one deployment and, for now, one WhatsApp number — see conversation.py's
+_resolve_business for how an inbound message gets routed to the right one.
+Businesses have a `vertical` (e.g. "food_ordering", "appointment_booking")
+that decides which conversation flow and which menu/service tables apply.
+Order/Appointment/MessageTemplate all carry business_id, so history stays
+correctly separated per business; Customer.business_id is different — see
+its own docstring — it's "which business is this phone talking to right
+now," not a permanent per-business identity.
 """
 from datetime import datetime, timezone
 
@@ -20,10 +25,81 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class Business(Base):
+    """
+    One tenant. is_default marks the business an inbound message resolves to
+    when its text doesn't match any business's own trigger_words AND the
+    phone has no existing relationship with any business yet — this is what
+    lets every pre-existing single-business behavior (a customer just saying
+    "order" with no keyword) keep working unchanged, while a NEW trigger word
+    ("salon", etc.) opens a completely different demo on the same number.
+    """
+    __tablename__ = "businesses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    slug: Mapped[str] = mapped_column(String(50), unique=True)
+    display_name: Mapped[str] = mapped_column(String(120))
+    vertical: Mapped[str] = mapped_column(String(32))  # "food_ordering" | "appointment_booking"
+    greeting_emoji: Mapped[str] = mapped_column(String(8), default="👋")
+    # Comma-separated, matched case-insensitively as whole words against the
+    # customer's very first (or any) message — see conversation.py.
+    trigger_words: Mapped[str] = mapped_column(String(200), default="")
+    is_default: Mapped[bool] = mapped_column(default=False)
+    review_link: Mapped[str] = mapped_column(String(300), default="")
+    payment_link_base: Mapped[str] = mapped_column(String(300), default="")  # food_ordering only
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    menu_items: Mapped[list["FoodMenuItem"]] = relationship(back_populates="business")
+    services: Mapped[list["AppointmentService"]] = relationship(back_populates="business")
+
+
+class FoodMenuItem(Base):
+    """A business's food_ordering menu item — the DB-backed equivalent of the
+    old business_config.py MenuItem dataclass, now per-tenant."""
+    __tablename__ = "food_menu_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"))
+    number: Mapped[str] = mapped_column(String(8))  # unique within the business, not globally
+    name: Mapped[str] = mapped_column(String(120))
+    price_ngn: Mapped[int] = mapped_column(Integer)
+    category: Mapped[str] = mapped_column(String(60))
+    quantity_unit: Mapped[str] = mapped_column(String(32), default="plates")
+
+    business: Mapped["Business"] = relationship(back_populates="menu_items")
+
+
+class AppointmentService(Base):
+    """A business's appointment_booking service (e.g. "Haircut")."""
+    __tablename__ = "appointment_services"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"))
+    number: Mapped[str] = mapped_column(String(8))
+    name: Mapped[str] = mapped_column(String(120))
+    duration_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    price_ngn: Mapped[int] = mapped_column(Integer, default=0)
+
+    business: Mapped["Business"] = relationship(back_populates="services")
+
+
 class Customer(Base):
+    """
+    business_id is which business this customer is CURRENTLY talking to, not
+    a permanent identity tuple — phone stays globally unique (one Customer
+    row per phone number, unchanged from before multi-tenancy) rather than
+    (business_id, phone), deliberately: this is a demo/MVP where a phone
+    number explores one business's flow at a time, not a real platform where
+    the same person is simultaneously an independent customer of several
+    businesses. Switching businesses (see conversation.py's _resolve_business)
+    updates business_id in place and resets the conversation — actual order/
+    appointment HISTORY stays correctly separated per business regardless,
+    since Order/Appointment carry their own business_id.
+    """
     __tablename__ = "customers"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"))
     phone: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -38,18 +114,22 @@ class Customer(Base):
     last_inbound_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     opted_out: Mapped[bool] = mapped_column(default=False)
 
+    business: Mapped["Business"] = relationship()
     conversation: Mapped["Conversation"] = relationship(back_populates="customer", uselist=False)
     orders: Mapped[list["Order"]] = relationship(back_populates="customer")
+    appointments: Mapped[list["Appointment"]] = relationship(back_populates="customer")
 
 
 class Conversation(Base):
     """
     Tracks exactly one thing: what state is this customer's chat in right now.
 
-    state is one of: "idle", "ordering", "awaiting_feedback".
-    draft_order is a JSON string holding whatever order fields have been
-    captured so far while state == "ordering" (item, quantity, address —
-    filled in incrementally as the customer answers).
+    state depends on the customer's business's vertical:
+      food_ordering:       idle | ordering | awaiting_feedback
+      appointment_booking: idle | booking
+    draft_order is a JSON string holding whatever fields have been captured so
+    far while mid-flow — its shape also depends on the vertical (see
+    conversation.py's _continue_order vs _continue_booking).
     """
     __tablename__ = "conversations"
 
@@ -75,6 +155,7 @@ class Order(Base):
     __tablename__ = "orders"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"))
     order_ref: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"))
     item: Mapped[str] = mapped_column(String(200))
@@ -85,6 +166,7 @@ class Order(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    business: Mapped["Business"] = relationship()
     customer: Mapped["Customer"] = relationship(back_populates="orders")
     feedback: Mapped["Feedback"] = relationship(back_populates="order", uselist=False)
     items: Mapped[list["OrderItem"]] = relationship(back_populates="order", order_by="OrderItem.id")
@@ -117,6 +199,24 @@ class Feedback(Base):
     order: Mapped["Order"] = relationship(back_populates="feedback")
 
 
+class Appointment(Base):
+    """A booked appointment_booking slot — the equivalent of Order for that vertical."""
+    __tablename__ = "appointments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"))
+    booking_ref: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"))
+    service_name: Mapped[str] = mapped_column(String(120))
+    price_ngn: Mapped[int] = mapped_column(Integer, default=0)
+    slot_at: Mapped[datetime] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(32), default="Confirmed")  # Confirmed | Cancelled | Completed
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    business: Mapped["Business"] = relationship()
+    customer: Mapped["Customer"] = relationship(back_populates="appointments")
+
+
 class MessageTemplate(Base):
     """
     A WhatsApp message template submitted for Meta's approval (app/admin.py's
@@ -125,13 +225,21 @@ class MessageTemplate(Base):
     status starts "PENDING" and is only ever updated by explicitly re-checking
     with Meta (there's no webhook wired up for template status changes), so
     it can go stale between checks — treat it as "as of the last refresh."
+    Scoped per business — a promo template for one business's customers
+    shouldn't be usable to message another business's.
     """
     __tablename__ = "message_templates"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"))
+    # Stays globally unique (unchanged from before multi-tenancy, avoids
+    # altering a constraint on a table that may already have real rows) — two
+    # businesses sharing this MVP just need distinct template names.
     name: Mapped[str] = mapped_column(String(120), unique=True)
     language: Mapped[str] = mapped_column(String(10), default="en_US")
     body_text: Mapped[str] = mapped_column(Text)
     has_variable: Mapped[bool] = mapped_column(default=False)
     status: Mapped[str] = mapped_column(String(32), default="PENDING")  # PENDING | APPROVED | REJECTED
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    business: Mapped["Business"] = relationship()

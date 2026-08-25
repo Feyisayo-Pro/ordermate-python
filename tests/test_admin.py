@@ -22,12 +22,13 @@ def admin_auth():
     settings.ADMIN_USERNAME, settings.ADMIN_PASSWORD = original
 
 
-def _make_order(db_session, order_ref="A-1111", status="Confirmed"):
-    customer = models.Customer(phone="2348012345678", name="Tolu")
+def _make_order(db_session, business, order_ref="A-1111", status="Confirmed"):
+    customer = models.Customer(phone="2348012345678", name="Tolu", business=business)
     db_session.add(customer)
     db_session.flush()
     db_session.add(models.Conversation(customer_id=customer.id, state="idle", draft_order="{}"))
     order = models.Order(
+        business_id=business.id,
         order_ref=order_ref,
         customer_id=customer.id,
         item="Jollof Rice + Chicken",
@@ -61,8 +62,8 @@ def test_dashboard_rejects_wrong_credentials(client, admin_auth):
     assert resp.status_code == 401
 
 
-def test_dashboard_shows_orders_with_correct_credentials(client, admin_auth, db_session):
-    _make_order(db_session)
+def test_dashboard_shows_orders_with_correct_credentials(client, admin_auth, db_session, default_business):
+    _make_order(db_session, default_business)
     resp = client.get("/admin/orders", auth=admin_auth)
     assert resp.status_code == 200
     assert "A-1111" in resp.text
@@ -70,14 +71,15 @@ def test_dashboard_shows_orders_with_correct_credentials(client, admin_auth, db_
     assert "14 Adeyemi Street" in resp.text
 
 
-def test_dashboard_shows_each_cart_line_item_separately(client, admin_auth, db_session):
+def test_dashboard_shows_each_cart_line_item_separately(client, admin_auth, db_session, default_business):
     # A real multi-item order (OrderItem rows present) should show each item
     # on its own line, not the legacy single "item" summary column value.
-    customer = models.Customer(phone="2348011112222", name="Bola")
+    customer = models.Customer(phone="2348011112222", name="Bola", business=default_business)
     db_session.add(customer)
     db_session.flush()
     db_session.add(models.Conversation(customer_id=customer.id, state="idle", draft_order="{}"))
     order = models.Order(
+        business_id=default_business.id,
         order_ref="A-2222",
         customer_id=customer.id,
         item="2x Fried Rice + Turkey, 1x Coca-Cola",
@@ -104,8 +106,8 @@ def test_dashboard_shows_empty_state_with_no_orders(client, admin_auth):
     assert "No orders yet" in resp.text
 
 
-def test_updating_status_to_delivered_schedules_feedback(client, admin_auth, db_session):
-    order = _make_order(db_session)
+def test_updating_status_to_delivered_schedules_feedback(client, admin_auth, db_session, default_business):
+    order = _make_order(db_session, default_business)
     resp = client.post(
         f"/admin/orders/{order.order_ref}/status",
         data={"new_status": "Delivered"},
@@ -119,8 +121,8 @@ def test_updating_status_to_delivered_schedules_feedback(client, admin_auth, db_
     assert order.delivered_at is not None
 
 
-def test_updating_status_to_preparing_is_a_plain_update(client, admin_auth, db_session):
-    order = _make_order(db_session)
+def test_updating_status_to_preparing_is_a_plain_update(client, admin_auth, db_session, default_business):
+    order = _make_order(db_session, default_business)
     resp = client.post(
         f"/admin/orders/{order.order_ref}/status",
         data={"new_status": "Preparing"},
@@ -134,8 +136,8 @@ def test_updating_status_to_preparing_is_a_plain_update(client, admin_auth, db_s
     assert order.delivered_at is None
 
 
-def test_updating_status_rejects_unrecognized_value(client, admin_auth, db_session):
-    order = _make_order(db_session)
+def test_updating_status_rejects_unrecognized_value(client, admin_auth, db_session, default_business):
+    order = _make_order(db_session, default_business)
     resp = client.post(
         f"/admin/orders/{order.order_ref}/status",
         data={"new_status": "Teleported"},
@@ -153,17 +155,17 @@ def test_updating_status_for_unknown_order_returns_404(client, admin_auth):
     assert resp.status_code == 404
 
 
-def test_status_update_requires_admin_credentials(client, admin_auth, db_session):
-    order = _make_order(db_session)
+def test_status_update_requires_admin_credentials(client, admin_auth, db_session, default_business):
+    order = _make_order(db_session, default_business)
     resp = client.post(f"/admin/orders/{order.order_ref}/status", data={"new_status": "Preparing"})
     assert resp.status_code == 401
 
 
-def _make_customer(db_session, phone, hours_since_last_message=1, opted_out=False, with_order=False):
+def _make_customer(db_session, business, phone, hours_since_last_message=1, opted_out=False, with_order=False):
     from datetime import datetime, timedelta, timezone
 
     customer = models.Customer(
-        phone=phone, name="Test",
+        phone=phone, name="Test", business=business,
         last_inbound_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours_since_last_message),
         opted_out=opted_out,
     )
@@ -172,6 +174,7 @@ def _make_customer(db_session, phone, hours_since_last_message=1, opted_out=Fals
     db_session.add(models.Conversation(customer_id=customer.id, state="idle", draft_order="{}"))
     if with_order:
         db_session.add(models.Order(
+            business_id=business.id,
             order_ref=f"A-{phone[-4:]}", customer_id=customer.id, item="Jollof Rice + Chicken",
             quantity=1, delivery_address="Somewhere", total_ngn=3500, status="Confirmed",
         ))
@@ -185,13 +188,13 @@ def test_broadcast_compose_page_loads(client, admin_auth):
     assert "Broadcast" in resp.text
 
 
-def test_broadcast_preview_splits_by_24h_window(client, admin_auth, db_session):
-    _make_customer(db_session, "2348011110001", hours_since_last_message=2)   # in window
-    _make_customer(db_session, "2348011110002", hours_since_last_message=48)  # outside window
+def test_broadcast_preview_splits_by_24h_window(client, admin_auth, db_session, default_business):
+    _make_customer(db_session, default_business, "2348011110001", hours_since_last_message=2)   # in window
+    _make_customer(db_session, default_business, "2348011110002", hours_since_last_message=48)  # outside window
 
     resp = client.post(
         "/admin/broadcast/preview",
-        data={"method": "text", "message": "We're open today!", "audience": "all"},
+        data={"business_id": default_business.id, "method": "text", "message": "We're open today!", "audience": "all"},
         auth=admin_auth,
     )
     assert resp.status_code == 200
@@ -199,26 +202,26 @@ def test_broadcast_preview_splits_by_24h_window(client, admin_auth, db_session):
     assert "1 customer(s) will be skipped" in resp.text
 
 
-def test_broadcast_preview_excludes_opted_out_customers(client, admin_auth, db_session):
-    _make_customer(db_session, "2348011110003", hours_since_last_message=1, opted_out=True)
+def test_broadcast_preview_excludes_opted_out_customers(client, admin_auth, db_session, default_business):
+    _make_customer(db_session, default_business, "2348011110003", hours_since_last_message=1, opted_out=True)
 
     resp = client.post(
         "/admin/broadcast/preview",
-        data={"method": "text", "message": "Hello!", "audience": "all"},
+        data={"business_id": default_business.id, "method": "text", "message": "Hello!", "audience": "all"},
         auth=admin_auth,
     )
     assert resp.status_code == 200
     assert "0 customer(s) will receive this now" in resp.text
 
 
-def test_broadcast_preview_excludes_the_owner_number(client, admin_auth, db_session):
+def test_broadcast_preview_excludes_the_owner_number(client, admin_auth, db_session, default_business):
     settings = get_settings()
     settings.OWNER_WHATSAPP_NUMBER = "2348099999999"
     try:
-        _make_customer(db_session, settings.OWNER_WHATSAPP_NUMBER, hours_since_last_message=1)
+        _make_customer(db_session, default_business, settings.OWNER_WHATSAPP_NUMBER, hours_since_last_message=1)
         resp = client.post(
             "/admin/broadcast/preview",
-            data={"method": "text", "message": "Hello!", "audience": "all"},
+            data={"business_id": default_business.id, "method": "text", "message": "Hello!", "audience": "all"},
             auth=admin_auth,
         )
         assert "0 customer(s) will receive this now" in resp.text
@@ -226,28 +229,28 @@ def test_broadcast_preview_excludes_the_owner_number(client, admin_auth, db_sess
         settings.OWNER_WHATSAPP_NUMBER = ""
 
 
-def test_broadcast_customers_audience_only_includes_those_with_an_order(client, admin_auth, db_session):
-    _make_customer(db_session, "2348011110004", hours_since_last_message=1, with_order=True)
-    _make_customer(db_session, "2348011110005", hours_since_last_message=1, with_order=False)
+def test_broadcast_customers_audience_only_includes_those_with_an_order(client, admin_auth, db_session, default_business):
+    _make_customer(db_session, default_business, "2348011110004", hours_since_last_message=1, with_order=True)
+    _make_customer(db_session, default_business, "2348011110005", hours_since_last_message=1, with_order=False)
 
     resp = client.post(
         "/admin/broadcast/preview",
-        data={"method": "text", "message": "Thanks for ordering!", "audience": "customers"},
+        data={"business_id": default_business.id, "method": "text", "message": "Thanks for ordering!", "audience": "customers"},
         auth=admin_auth,
     )
     assert "1 customer(s) will receive this now" in resp.text
 
 
-def test_broadcast_send_only_messages_in_window_customers_and_reports_counts(client, admin_auth, db_session, caplog):
+def test_broadcast_send_only_messages_in_window_customers_and_reports_counts(client, admin_auth, db_session, default_business, caplog):
     import logging
 
-    _make_customer(db_session, "2348011110006", hours_since_last_message=1)
-    _make_customer(db_session, "2348011110007", hours_since_last_message=48)
+    _make_customer(db_session, default_business, "2348011110006", hours_since_last_message=1)
+    _make_customer(db_session, default_business, "2348011110007", hours_since_last_message=48)
 
     with caplog.at_level(logging.INFO):
         resp = client.post(
             "/admin/broadcast/send",
-            data={"method": "text", "message": "We're open today!", "audience": "all"},
+            data={"business_id": default_business.id, "method": "text", "message": "We're open today!", "audience": "all"},
             auth=admin_auth,
             follow_redirects=False,
         )
@@ -259,15 +262,16 @@ def test_broadcast_send_only_messages_in_window_customers_and_reports_counts(cli
 
 
 def test_broadcast_requires_admin_credentials(client, admin_auth, db_session):
-    resp = client.post("/admin/broadcast/preview", data={"method": "text", "message": "hi", "audience": "all"})
+    resp = client.post("/admin/broadcast/preview", data={"business_id": "1", "method": "text", "message": "hi", "audience": "all"})
     assert resp.status_code == 401
-    resp = client.post("/admin/broadcast/send", data={"method": "text", "message": "hi", "audience": "all"})
+    resp = client.post("/admin/broadcast/send", data={"business_id": "1", "method": "text", "message": "hi", "audience": "all"})
     assert resp.status_code == 401
 
 
-def _make_approved_template(db_session, name="reopen_promo", has_variable=True):
+def _make_approved_template(db_session, business, name="reopen_promo", has_variable=True):
     tpl = models.MessageTemplate(
-        name=name, language="en_US", body_text="Hi {{1}}, we're open again!" if has_variable else "We're open again!",
+        business_id=business.id, name=name, language="en_US",
+        body_text="Hi {{1}}, we're open again!" if has_variable else "We're open again!",
         has_variable=has_variable, status="APPROVED",
     )
     db_session.add(tpl)
@@ -281,7 +285,7 @@ def test_templates_page_loads(client, admin_auth):
     assert "templates" in resp.text.lower()
 
 
-def test_creating_a_template_submits_it_and_stores_the_result(client, admin_auth, monkeypatch):
+def test_creating_a_template_submits_it_and_stores_the_result(client, admin_auth, default_business, monkeypatch):
     settings = get_settings()
     settings.WHATSAPP_ACCESS_TOKEN = "fake-token"
     settings.WHATSAPP_BUSINESS_ACCOUNT_ID = "waba-123"
@@ -292,7 +296,7 @@ def test_creating_a_template_submits_it_and_stores_the_result(client, admin_auth
     try:
         resp = client.post(
             "/admin/templates",
-            data={"name": "We're Open Again", "body_text": "Hi {{1}}, we're back!"},
+            data={"business_id": default_business.id, "name": "We're Open Again", "body_text": "Hi {{1}}, we're back!"},
             auth=admin_auth,
             follow_redirects=False,
         )
@@ -310,13 +314,13 @@ def test_creating_a_template_requires_business_account_id_configured(client, adm
     settings = get_settings()
     assert settings.template_management_configured is False
     resp = client.post(
-        "/admin/templates", data={"name": "promo", "body_text": "Hello!"}, auth=admin_auth,
+        "/admin/templates", data={"business_id": "1", "name": "promo", "body_text": "Hello!"}, auth=admin_auth,
     )
     assert resp.status_code == 503
 
 
-def test_refreshing_a_template_status_updates_it(client, admin_auth, db_session, monkeypatch):
-    tpl = models.MessageTemplate(name="promo", language="en_US", body_text="Hello!", status="PENDING")
+def test_refreshing_a_template_status_updates_it(client, admin_auth, db_session, default_business, monkeypatch):
+    tpl = models.MessageTemplate(business_id=default_business.id, name="promo", language="en_US", body_text="Hello!", status="PENDING")
     db_session.add(tpl)
     db_session.commit()
 
@@ -328,13 +332,13 @@ def test_refreshing_a_template_status_updates_it(client, admin_auth, db_session,
     assert tpl.status == "APPROVED"
 
 
-def test_broadcast_preview_offers_approved_templates_and_ignores_the_24h_window(client, admin_auth, db_session):
-    _make_approved_template(db_session)
-    _make_customer(db_session, "2348011110008", hours_since_last_message=48)  # would be skipped for free-text
+def test_broadcast_preview_offers_approved_templates_and_ignores_the_24h_window(client, admin_auth, db_session, default_business):
+    _make_approved_template(db_session, default_business)
+    _make_customer(db_session, default_business, "2348011110008", hours_since_last_message=48)  # would be skipped for free-text
 
     resp = client.post(
         "/admin/broadcast/preview",
-        data={"method": "template:1", "audience": "all"},
+        data={"business_id": default_business.id, "method": "template:1", "audience": "all"},
         auth=admin_auth,
     )
     assert resp.status_code == 200
@@ -342,16 +346,16 @@ def test_broadcast_preview_offers_approved_templates_and_ignores_the_24h_window(
     assert "will be skipped" not in resp.text
 
 
-def test_broadcast_send_via_template_fills_in_the_customers_name(client, admin_auth, db_session, caplog):
+def test_broadcast_send_via_template_fills_in_the_customers_name(client, admin_auth, db_session, default_business, caplog):
     import logging
 
-    _make_approved_template(db_session, has_variable=True)
-    _make_customer(db_session, "2348011110009", hours_since_last_message=48)
+    _make_approved_template(db_session, default_business, has_variable=True)
+    _make_customer(db_session, default_business, "2348011110009", hours_since_last_message=48)
 
     with caplog.at_level(logging.INFO):
         resp = client.post(
             "/admin/broadcast/send",
-            data={"method": "template:1", "audience": "all"},
+            data={"business_id": default_business.id, "method": "template:1", "audience": "all"},
             auth=admin_auth,
             follow_redirects=False,
         )

@@ -2,12 +2,21 @@
 Conversation orchestration — the piece that decides what happens for each
 inbound message.
 
-Design: a tiny explicit state machine (idle / ordering / awaiting_feedback)
-stored per-customer in the Conversation table, delegating the "what did they
-actually say" understanding to app.ai. Explicit state means the bot never
-gets confused about whether a bare number like "2" means "quantity: 2" or
-"rating: 2 stars" — that ambiguity is exactly why free-form AI-only parsing
-without state gets unreliable fast.
+Design: a tiny explicit state machine stored per-customer in the
+Conversation table, delegating the "what did they actually say" understanding
+to app.ai. Explicit state means the bot never gets confused about whether a
+bare number like "2" means "quantity: 2" or "rating: 2 stars" — that
+ambiguity is exactly why free-form AI-only parsing without state gets
+unreliable fast.
+
+Multi-tenant: each Customer belongs to exactly one Business at a time
+(customer.business_id — see models.py's Customer docstring for why it's a
+"currently talking to" pointer, not a permanent identity). state's possible
+values depend on that business's vertical:
+  food_ordering:       idle | ordering | awaiting_feedback
+  appointment_booking: idle | booking
+_resolve_customer decides, on every inbound message, which business a phone
+number is actually talking to right now.
 """
 from __future__ import annotations
 
@@ -16,13 +25,12 @@ import logging
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 
-from app import ai, models
-from app.business_config import ACTIVE_BUSINESS
+from app import ai, businesses, models
 from app.config import get_settings
 from app.scheduler import cancel_abandoned_order_nudge, schedule_abandoned_order_nudge, schedule_feedback_request
 from app.whatsapp_client import (
@@ -40,22 +48,56 @@ log = logging.getLogger("ordermate.conversation")
 settings = get_settings()
 
 
-def _get_or_create_customer(db: Session, phone: str, name: str) -> models.Customer:
+def _resolve_customer(db: Session, phone: str, name: str, text: str) -> tuple[models.Customer, bool]:
+    """
+    Returns (customer, starts_new_flow). starts_new_flow is True only when
+    this exact message is itself the routing signal — a brand-new customer's
+    message matched some business's trigger word, or an existing customer
+    explicitly switched businesses — meaning the caller should jump straight
+    into that business's primary flow rather than running intent
+    classification on what was actually a "which business" signal, not a
+    request layered on top of an existing conversation.
+
+    Deliberately NOT set just because the customer is brand new (a first-ever
+    "hi" with no trigger match still needs the normal fallback greeting, not
+    to be treated as "start ordering") and NOT set when an EXISTING customer's
+    message merely happens to contain another business's trigger word as a
+    word (not the point) while mid-flow on their current business — e.g. an
+    address like "22 Restaurant Road" mid-order must not be mistaken for an
+    explicit switch away from the business they're already mid-flow with.
+    """
     customer = db.query(models.Customer).filter_by(phone=phone).one_or_none()
+    matched_business = businesses.get_business_by_trigger(db, text)
+    is_new_customer = customer is None
+    switched_business = False
+
     if customer is None:
-        customer = models.Customer(phone=phone, name=name or "")
+        business = matched_business or businesses.get_default_business(db)
+        customer = models.Customer(phone=phone, name=name or "", business=business)
         db.add(customer)
         db.flush()
         db.add(models.Conversation(customer_id=customer.id, state="idle", draft_order="{}"))
         db.flush()
-    elif name and not customer.name:
-        customer.name = name
+    else:
+        if name and not customer.name:
+            customer.name = name
+        if matched_business and matched_business.id != customer.business_id:
+            # Order/appointment HISTORY is untouched by this — those rows
+            # carry their own business_id regardless of what this Customer
+            # row's business_id becomes next.
+            customer.business = matched_business
+            customer.conversation.state = "idle"
+            customer.conversation.draft_order = "{}"
+            switched_business = True
+
     # Drives broadcast messaging's 24h-window check (app/admin.py) — WhatsApp
     # only allows a free-text message within 24h of the customer's last
     # message, so this needs to reflect every real inbound message, not just
     # ones that happen to change something else about the customer.
     customer.last_inbound_at = datetime.now(timezone.utc)
-    return customer
+
+    starts_new_flow = switched_business or (is_new_customer and matched_business is not None)
+    return customer, starts_new_flow
 
 
 _OPT_OUT_RE = re.compile(r"\b(unsubscribe|opt[ -]?out|stop messages?|remove me)\b", re.I)
@@ -63,6 +105,10 @@ _OPT_OUT_RE = re.compile(r"\b(unsubscribe|opt[ -]?out|stop messages?|remove me)\
 
 def _new_order_ref() -> str:
     return f"A-{random.randint(1000, 9999)}"
+
+
+def _new_booking_ref() -> str:
+    return f"B-{random.randint(1000, 9999)}"
 
 
 def _ordinal(n: int) -> str:
@@ -88,14 +134,16 @@ def handle_incoming_message(db: Session, phone: str, name: str, text: str) -> li
         # Not a recognized owner command (e.g. the owner is just testing the
         # bot themselves) — fall through to normal customer-facing handling.
 
-    customer = _get_or_create_customer(db, phone, name)
+    customer, starts_new_flow = _resolve_customer(db, phone, name, text)
+    business = customer.business
     convo = customer.conversation
 
     if _OPT_OUT_RE.search(text):
         # Checked globally, regardless of conversation state, and deliberately
         # does NOT touch convo.state/draft_order — this only excludes the
         # customer from future broadcast messages (app/admin.py), it doesn't
-        # cancel an order in progress or otherwise change what they're doing.
+        # cancel an order/booking in progress or otherwise change what
+        # they're doing.
         customer.opted_out = True
         db.commit()
         reply = "You've been unsubscribed from promotional messages 👍 You can still place orders and get order updates anytime."
@@ -104,7 +152,14 @@ def handle_incoming_message(db: Session, phone: str, name: str, text: str) -> li
 
     replies: list[str] = []
 
-    if convo.state == "awaiting_feedback":
+    if starts_new_flow:
+        if business.vertical == "appointment_booking":
+            convo.state = "booking"
+            replies = _continue_booking(db, customer, convo, text, first_turn=True)
+        else:
+            convo.state = "ordering"
+            replies = _continue_order(db, customer, convo, text, first_turn=True)
+    elif convo.state == "awaiting_feedback":
         replies = _handle_feedback(db, customer, convo, text)
     elif convo.state == "ordering":
         # Checked before _continue_order, not through classify_intent — while
@@ -116,14 +171,28 @@ def handle_incoming_message(db: Session, phone: str, name: str, text: str) -> li
             replies = _handle_cancel_order(customer, convo)
         else:
             replies = _continue_order(db, customer, convo, text)
+    elif convo.state == "booking":
+        if _CANCEL_WORDS.search(text):
+            replies = _handle_cancel_booking(customer, convo)
+        else:
+            replies = _continue_booking(db, customer, convo, text)
     else:
         intent = ai.classify_intent(text)
         if intent == "new_order":
-            convo.state = "ordering"
-            convo.draft_order = "{}"
-            replies = _continue_order(db, customer, convo, text, first_turn=True)
+            if business.vertical == "appointment_booking":
+                convo.state = "booking"
+                convo.draft_order = "{}"
+                replies = _continue_booking(db, customer, convo, text, first_turn=True)
+            else:
+                convo.state = "ordering"
+                convo.draft_order = "{}"
+                replies = _continue_order(db, customer, convo, text, first_turn=True)
         elif intent == "track_order":
-            replies = _handle_track_order(db, customer)
+            replies = (
+                _handle_track_booking(db, customer)
+                if business.vertical == "appointment_booking"
+                else _handle_track_order(db, customer)
+            )
         elif intent == "feedback":
             # customer volunteered a rating without us asking — still handle it
             replies = _handle_feedback(db, customer, convo, text, unsolicited=True)
@@ -156,20 +225,19 @@ def handle_incoming_message(db: Session, phone: str, name: str, text: str) -> li
     return replies
 
 
-def _menu_categories() -> list[str]:
-    return list(dict.fromkeys(item.category for item in ACTIVE_BUSINESS.menu))  # preserves order, dedups
+# ---------------------------------------------------------------------------
+# food_ordering vertical
+# ---------------------------------------------------------------------------
 
-
-def _category_list_menu(body: str) -> ListMenu:
-    rows = [ListMenuRow(id=c, title=c) for c in _menu_categories()]
+def _category_list_menu(db: Session, business_id: int, body: str) -> ListMenu:
+    categories = businesses.menu_categories(db, business_id)
+    rows = [ListMenuRow(id=c, title=c) for c in categories]
     return ListMenu(body=body, button_text="View Categories", sections=[ListMenuSection(title="Categories", rows=rows)])
 
 
-def _item_list_menu(body: str, category: str) -> ListMenu:
-    rows = [
-        ListMenuRow(id=m.number, title=m.name, description=f"₦{m.price_ngn:,}")
-        for m in ACTIVE_BUSINESS.menu if m.category == category
-    ]
+def _item_list_menu(db: Session, business_id: int, body: str, category: str) -> ListMenu:
+    items = db.query(models.FoodMenuItem).filter_by(business_id=business_id, category=category).order_by(models.FoodMenuItem.id).all()
+    rows = [ListMenuRow(id=m.number, title=m.name, description=f"₦{m.price_ngn:,}") for m in items]
     return ListMenu(body=body, button_text="Select Item", sections=[ListMenuSection(title=category, rows=rows)])
 
 
@@ -187,6 +255,7 @@ def _handle_cancel_order(customer: models.Customer, convo: models.Conversation) 
 
 
 def _continue_order(db: Session, customer: models.Customer, convo: models.Conversation, text: str, first_turn: bool = False) -> list:
+    business = customer.business
     draft = json.loads(convo.draft_order or "{}")
     greeting = f"Hey {customer.name}! 👋 " if customer.name else "Hey! 👋 "
 
@@ -194,16 +263,16 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
         # First message just triggered the "new_order" intent (e.g. "do you
         # sell jollof today?") — greet + show categories rather than treating
         # that message itself as a selection.
-        categories = _menu_categories()
+        categories = businesses.menu_categories(db, business.id)
         schedule_abandoned_order_nudge(customer.id)
         if len(categories) <= 1:
             # Nothing to categorize — skip straight to the item list, same as
             # the old single-tier menu behavior.
             only_category = categories[0] if categories else ""
             convo.draft_order = json.dumps({"category": only_category})
-            return [_item_list_menu(f"{greeting}Here's today's menu:", only_category)]
+            return [_item_list_menu(db, business.id, f"{greeting}Here's today's menu:", only_category)]
         convo.draft_order = "{}"
-        return [_category_list_menu(f"{greeting}Here's today's menu — pick a category:")]
+        return [_category_list_menu(db, business.id, f"{greeting}Here's today's menu — pick a category:")]
 
     if draft.get("awaiting_address"):
         # Checked before the category check below: an item was just added to
@@ -216,16 +285,16 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
     if not draft.get("category"):
         # Case-insensitive: matches both a tapped list row (id == category
         # name) and a customer typing the category name directly.
-        chosen = next((c for c in _menu_categories() if c.lower() == text.strip().lower()), None)
+        chosen = next((c for c in businesses.menu_categories(db, business.id) if c.lower() == text.strip().lower()), None)
         schedule_abandoned_order_nudge(customer.id)
         if not chosen:
-            return [_category_list_menu("Not sure I caught that — pick a category:")]
+            return [_category_list_menu(db, business.id, "Not sure I caught that — pick a category:")]
         draft["category"] = chosen
         convo.draft_order = json.dumps(draft)
-        return [_item_list_menu(f"Great, here's what's in {chosen}:", chosen)]
+        return [_item_list_menu(db, business.id, f"Great, here's what's in {chosen}:", chosen)]
 
     if not draft.get("item"):
-        category_items = [m for m in ACTIVE_BUSINESS.menu if m.category == draft["category"]]
+        category_items = db.query(models.FoodMenuItem).filter_by(business_id=business.id, category=draft["category"]).all()
         stripped = text.strip()
         # Matches a tapped row (id == number) or the row's number typed
         # directly, but also the item's exact name — the list message shows
@@ -237,7 +306,7 @@ def _continue_order(db: Session, customer: models.Customer, convo: models.Conver
         )
         schedule_abandoned_order_nudge(customer.id)
         if not chosen_item:
-            return [_item_list_menu(f"Not sure I caught that — here's {draft['category']} again:", draft["category"])]
+            return [_item_list_menu(db, business.id, f"Not sure I caught that — here's {draft['category']} again:", draft["category"])]
         draft["item"] = chosen_item.name
         draft["_unit_price"] = chosen_item.price_ngn
         draft["_quantity_unit"] = chosen_item.quantity_unit
@@ -292,8 +361,13 @@ def _continue_cart_or_address(db: Session, customer: models.Customer, convo: mod
     as it always has; only text that actually looks like "add another item"
     diverts into that path.
     """
-    categories = _menu_categories()
-    decision = ai.classify_cart_continuation(text, categories)
+    business = customer.business
+    categories = businesses.menu_categories(db, business.id)
+    item_categories = {
+        m.name.lower(): m.category
+        for m in db.query(models.FoodMenuItem).filter_by(business_id=business.id).all()
+    }
+    decision = ai.classify_cart_continuation(text, categories, item_categories)
     schedule_abandoned_order_nudge(customer.id)
 
     if decision.wants_more:
@@ -301,14 +375,14 @@ def _continue_cart_or_address(db: Session, customer: models.Customer, convo: mod
         if decision.category:
             draft["category"] = decision.category
             convo.draft_order = json.dumps(draft)
-            return [_item_list_menu(f"Sure — here's what's in {decision.category}:", decision.category)]
+            return [_item_list_menu(db, business.id, f"Sure — here's what's in {decision.category}:", decision.category)]
         if len(categories) <= 1:
             only_category = categories[0] if categories else ""
             draft["category"] = only_category
             convo.draft_order = json.dumps(draft)
-            return [_item_list_menu(f"Sure — here's what's in {only_category}:", only_category)]
+            return [_item_list_menu(db, business.id, f"Sure — here's what's in {only_category}:", only_category)]
         convo.draft_order = json.dumps(draft)
-        return [_category_list_menu("Sure — pick a category for the next item:")]
+        return [_category_list_menu(db, business.id, "Sure — pick a category for the next item:")]
 
     if not decision.has_address:
         # Confirms they're done adding items ("checkout", "that's all"), but
@@ -324,10 +398,12 @@ def _continue_cart_or_address(db: Session, customer: models.Customer, convo: mod
 
 
 def _finalize_order(db: Session, customer: models.Customer, convo: models.Conversation, draft: dict, delivery_address: str) -> list[str]:
+    business = customer.business
     cart = draft["cart"]
     cart_total = sum(i["subtotal"] for i in cart)
     single = len(cart) == 1
     order = models.Order(
+        business_id=business.id,
         order_ref=_new_order_ref(),
         customer_id=customer.id,
         item=cart[0]["item"] if single else ", ".join(f"{i['quantity']}x {i['item']}" for i in cart),
@@ -356,8 +432,10 @@ def _finalize_order(db: Session, customer: models.Customer, convo: models.Conver
     # Recognition only, no discount — a real automatic discount is a pricing
     # decision for the business owner to make deliberately, not something to
     # bolt on here. Counts this order too (already flushed), so 2 == their
-    # 2nd order ever.
-    order_count = db.query(models.Order).filter_by(customer_id=customer.id).count()
+    # 2nd order ever. Scoped to THIS business — a customer's order count with
+    # a different business (if they've ever switched demos) shouldn't count
+    # toward "repeat customer" here.
+    order_count = db.query(models.Order).filter_by(customer_id=customer.id, business_id=business.id).count()
     is_repeat_customer = order_count >= 2
     items_lines = "\n".join(f"  {i['quantity']}x {i['item']}" for i in cart)
 
@@ -367,7 +445,7 @@ def _finalize_order(db: Session, customer: models.Customer, convo: models.Conver
     if settings.OWNER_WHATSAPP_NUMBER:
         repeat_note = f" (repeat customer — {_ordinal(order_count)} order)" if is_repeat_customer else ""
         owner_alert = (
-            f"🆕 New order #{order.order_ref}!{repeat_note}\n"
+            f"🆕 New order #{order.order_ref} ({business.display_name})!{repeat_note}\n"
             f"{items_lines}\n"
             f"Total: ₦{order.total_ngn:,}\n"
             f"From: {customer.name or customer.phone} ({customer.phone})\n"
@@ -375,7 +453,7 @@ def _finalize_order(db: Session, customer: models.Customer, convo: models.Conver
         )
         send_message(settings.OWNER_WHATSAPP_NUMBER, owner_alert)
 
-    payment_link = f"{ACTIVE_BUSINESS.payment_link_base}{order.order_ref.split('-')[-1]}"
+    payment_link = f"{business.payment_link_base}{order.order_ref.split('-')[-1]}"
     items_summary = "\n".join(f"{i['quantity']}x {i['item']} — ₦{i['subtotal']:,}" for i in cart)
     confirmation = (
         f"All set{', ' + customer.name if customer.name else ''}! 🎉\n"
@@ -389,6 +467,167 @@ def _finalize_order(db: Session, customer: models.Customer, convo: models.Conver
         confirmation += f"\n\n🌟 This is your {_ordinal(order_count)} order with us — thank you for coming back!"
     return [confirmation]
 
+
+def _handle_track_order(db: Session, customer: models.Customer) -> list[str]:
+    order = (
+        db.query(models.Order)
+        .filter_by(customer_id=customer.id, business_id=customer.business_id)
+        .order_by(models.Order.created_at.desc())
+        .first()
+    )
+    if not order:
+        return ["I don't see any orders on your account yet — want to place one? Just say 'order' 🙂"]
+    return [f"Your order #{order.order_ref} is currently: {order.status} 📦"]
+
+
+# ---------------------------------------------------------------------------
+# appointment_booking vertical
+# ---------------------------------------------------------------------------
+
+_SLOT_HOURS = (10, 13, 16)  # 10am / 1pm / 4pm, business-local wall-clock time
+
+
+def _upcoming_slots(count: int = 9) -> list[datetime]:
+    """Generates `count` upcoming appointment slots, several per day starting
+    tomorrow (never today — avoids offering a slot that's already too soon to
+    realistically prepare for). No real calendar/double-booking check against
+    other bookings — an acceptable simplification for this MVP demo, not
+    something to rely on for a real, high-volume business."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None, minute=0, second=0, microsecond=0)
+    slots = []
+    day_offset = 1
+    while len(slots) < count:
+        day = now + timedelta(days=day_offset)
+        for hour in _SLOT_HOURS:
+            if len(slots) >= count:
+                break
+            slots.append(day.replace(hour=hour))
+        day_offset += 1
+    return slots
+
+
+def _format_slot(slot: datetime) -> str:
+    time_str = slot.strftime("%I:%M %p")
+    if time_str.startswith("0"):
+        time_str = time_str[1:]
+    return f"{slot.strftime('%a %b %d')}, {time_str}"
+
+
+def _service_list_menu(db: Session, business_id: int, body: str) -> ListMenu:
+    services = db.query(models.AppointmentService).filter_by(business_id=business_id).order_by(models.AppointmentService.id).all()
+    rows = [
+        ListMenuRow(id=s.number, title=s.name, description=f"₦{s.price_ngn:,} · {s.duration_minutes}min")
+        for s in services
+    ]
+    return ListMenu(body=body, button_text="Select Service", sections=[ListMenuSection(title="Services", rows=rows)])
+
+
+def _slot_list_menu(body: str, slots: list[datetime]) -> ListMenu:
+    rows = [ListMenuRow(id=str(i), title=_format_slot(s)) for i, s in enumerate(slots, start=1)]
+    return ListMenu(body=body, button_text="Pick a Time", sections=[ListMenuSection(title="Available Times", rows=rows)])
+
+
+def _handle_cancel_booking(customer: models.Customer, convo: models.Conversation) -> list[str]:
+    convo.state = "idle"
+    convo.draft_order = "{}"
+    cancel_abandoned_order_nudge(customer.id)
+    return ["No problem, I've cancelled that 👍 Let me know whenever you're ready to book again."]
+
+
+def _continue_booking(db: Session, customer: models.Customer, convo: models.Conversation, text: str, first_turn: bool = False) -> list:
+    business = customer.business
+    draft = json.loads(convo.draft_order or "{}")
+
+    if first_turn:
+        schedule_abandoned_order_nudge(customer.id)
+        convo.draft_order = "{}"
+        greeting = f"Hey {customer.name}! " if customer.name else "Hey! "
+        return [_service_list_menu(db, business.id, f"{greeting}{business.greeting_emoji} Here's what {business.display_name} offers — pick a service:")]
+
+    if not draft.get("service"):
+        services = db.query(models.AppointmentService).filter_by(business_id=business.id).all()
+        stripped = text.strip()
+        chosen = next((s for s in services if s.number == stripped or s.name.lower() == stripped.lower()), None)
+        schedule_abandoned_order_nudge(customer.id)
+        if not chosen:
+            return [_service_list_menu(db, business.id, "Not sure I caught that — pick a service:")]
+        draft["service"] = chosen.name
+        draft["_price"] = chosen.price_ngn
+        slots = _upcoming_slots()
+        draft["_slots"] = [s.isoformat() for s in slots]
+        convo.draft_order = json.dumps(draft)
+        return [_slot_list_menu(f"Great choice 💇 {chosen.name} — pick a time:", slots)]
+
+    # Service chosen, time slot still needed. Slots were generated and stored
+    # (as ISO strings) when the list was first shown, then matched against
+    # HERE rather than regenerated — regenerating could drift if enough time
+    # passes between showing the list and the customer replying (e.g. across
+    # a day boundary), showing a different set than what they're looking at.
+    slots = [datetime.fromisoformat(s) for s in draft.get("_slots", [])]
+    stripped = text.strip()
+    chosen_slot = None
+    if stripped.isdigit() and 1 <= int(stripped) <= len(slots):
+        chosen_slot = slots[int(stripped) - 1]
+    schedule_abandoned_order_nudge(customer.id)
+    if chosen_slot is None:
+        return [_slot_list_menu("Not sure I caught that — pick a time:", slots)]
+
+    return _finalize_booking(db, customer, convo, draft, chosen_slot)
+
+
+def _finalize_booking(db: Session, customer: models.Customer, convo: models.Conversation, draft: dict, slot_at: datetime) -> list[str]:
+    business = customer.business
+    appointment = models.Appointment(
+        business_id=business.id,
+        booking_ref=_new_booking_ref(),
+        customer_id=customer.id,
+        service_name=draft["service"],
+        price_ngn=draft["_price"],
+        slot_at=slot_at,
+        status="Confirmed",
+    )
+    db.add(appointment)
+    db.flush()
+
+    convo.state = "idle"
+    convo.draft_order = "{}"
+    cancel_abandoned_order_nudge(customer.id)
+
+    time_str = _format_slot(slot_at)
+    if settings.OWNER_WHATSAPP_NUMBER:
+        owner_alert = (
+            f"🆕 New booking #{appointment.booking_ref} ({business.display_name})!\n"
+            f"{appointment.service_name} — ₦{appointment.price_ngn:,}\n"
+            f"When: {time_str}\n"
+            f"From: {customer.name or customer.phone} ({customer.phone})"
+        )
+        send_message(settings.OWNER_WHATSAPP_NUMBER, owner_alert)
+
+    confirmation = (
+        f"All set{', ' + customer.name if customer.name else ''}! 🎉\n"
+        f"Booking #{appointment.booking_ref} confirmed\n"
+        f"{appointment.service_name} — ₦{appointment.price_ngn:,}\n"
+        f"When: {time_str}\n\n"
+        "See you then!"
+    )
+    return [confirmation]
+
+
+def _handle_track_booking(db: Session, customer: models.Customer) -> list[str]:
+    appointment = (
+        db.query(models.Appointment)
+        .filter_by(customer_id=customer.id, business_id=customer.business_id)
+        .order_by(models.Appointment.created_at.desc())
+        .first()
+    )
+    if not appointment:
+        return ["I don't see any bookings on your account yet — want to book one? Just say 'book' 🙂"]
+    return [f"Your booking #{appointment.booking_ref} ({appointment.service_name}) is currently: {appointment.status} — {_format_slot(appointment.slot_at)}"]
+
+
+# ---------------------------------------------------------------------------
+# Shared across verticals
+# ---------------------------------------------------------------------------
 
 _DELIVERED_COMMAND_RE = re.compile(r"^delivered\s+#?([A-Za-z]+-?\d+)$", re.I)
 
@@ -414,18 +653,6 @@ def _handle_owner_command(db: Session, text: str) -> str | None:
     return f"✅ Order #{order.order_ref} marked delivered. Feedback request scheduled."
 
 
-def _handle_track_order(db: Session, customer: models.Customer) -> list[str]:
-    order = (
-        db.query(models.Order)
-        .filter_by(customer_id=customer.id)
-        .order_by(models.Order.created_at.desc())
-        .first()
-    )
-    if not order:
-        return ["I don't see any orders on your account yet — want to place one? Just say 'order' 🙂"]
-    return [f"Your order #{order.order_ref} is currently: {order.status} 📦"]
-
-
 def _handle_feedback(db: Session, customer: models.Customer, convo: models.Conversation, text: str, unsolicited: bool = False) -> list[str]:
     order = (
         db.query(models.Order)
@@ -442,7 +669,7 @@ def _handle_feedback(db: Session, customer: models.Customer, convo: models.Conve
     convo.state = "idle"
 
     if rating >= 4:
-        return [f"That makes our day! 🥹 Would you drop a quick review? {ACTIVE_BUSINESS.review_link}"]
+        return [f"That makes our day! 🥹 Would you drop a quick review? {customer.business.review_link}"]
 
     # Low rating: don't just thank them — alert the owner so they can follow up
     # before it turns into a public bad review.
@@ -476,12 +703,17 @@ def _fallback_message(customer: models.Customer) -> ButtonMenu:
     # Button ids are "1"/"2"/"3" (not "new_order" etc.) deliberately — that's
     # the same convention _MENU_NUMBER_INTENTS already handles for a typed
     # reply, so a tapped button needs zero new logic in ai.py.
+    business = customer.business
     name = f" {customer.name}" if customer.name else ""
+    if business.vertical == "appointment_booking":
+        primary_label, track_label = "Book an appointment", "Track my booking"
+    else:
+        primary_label, track_label = "Place an order", "Track my order"
     return ButtonMenu(
-        body=f"Hey{name}! {ACTIVE_BUSINESS.greeting_emoji} Welcome to {ACTIVE_BUSINESS.display_name}. What would you like to do?",
+        body=f"Hey{name}! {business.greeting_emoji} Welcome to {business.display_name}. What would you like to do?",
         options=[
-            ButtonOption(id="1", title="Place an order"),
-            ButtonOption(id="2", title="Track my order"),
+            ButtonOption(id="1", title=primary_label),
+            ButtonOption(id="2", title=track_label),
             ButtonOption(id="3", title="Speak to a human"),
         ],
     )
@@ -570,8 +802,10 @@ def send_abandoned_order_nudge(db: Session, customer_id: int) -> None:
     """
     Fired by the scheduled job in app/scheduler.py. Re-checks both the
     conversation state AND how long it's actually been quiet before sending.
+    Fires for either vertical's mid-flow state ("ordering" or "booking") —
+    the message itself is generic enough not to need to know which.
 
-    The state check alone isn't sufficient: every reply while ordering
+    The state check alone isn't sufficient: every reply while mid-flow
     reschedules this job (replace_existing=True), which usually means a
     customer who keeps replying never gets nudged — but if a reply arrives
     right as an old job's timer is about to fire, the reschedule can lose
@@ -581,7 +815,7 @@ def send_abandoned_order_nudge(db: Session, customer_id: int) -> None:
     reschedule was late, rather than just tightening the window and hoping.
     """
     customer = db.get(models.Customer, customer_id)
-    if not customer or customer.conversation.state != "ordering":
+    if not customer or customer.conversation.state not in ("ordering", "booking"):
         return
 
     convo = customer.conversation
@@ -591,5 +825,6 @@ def send_abandoned_order_nudge(db: Session, customer_id: int) -> None:
         return  # customer was active more recently than this job's timer assumed — stale firing
 
     name = f" {customer.name}" if customer.name else ""
-    message = f"Hey{name} 👋 Still with us? Want to finish your order — just reply and we'll pick up where we left off 🙂"
+    verb = "book" if convo.state == "booking" else "finish your order"
+    message = f"Hey{name} 👋 Still with us? Want to {verb} — just reply and we'll pick up where we left off 🙂"
     send_message(customer.phone, message)

@@ -42,11 +42,12 @@
 
     <table>
         <thead>
-            <tr><th>Name</th><th>Body</th><th>Status</th><th>Submitted</th><th></th></tr>
+            <tr><th>Business</th><th>Name</th><th>Body</th><th>Status</th><th>Submitted</th><th></th></tr>
         </thead>
         <tbody>
         {% for t in templates %}
             <tr>
+                <td>{{ t.business.display_name }}</td>
                 <td><strong>{{ t.name }}</strong></td>
                 <td>{{ t.body_text }}</td>
                 <td><span class="badge badge-{{ t.status }}">{{ t.status }}</span></td>
@@ -58,7 +59,7 @@
                 </td>
             </tr>
         {% else %}
-            <tr><td colspan="5" class="empty">No templates submitted yet.</td></tr>
+            <tr><td colspan="6" class="empty">No templates submitted yet.</td></tr>
         {% endfor %}
         </tbody>
     </table>
@@ -66,6 +67,14 @@
     <div class="card">
         <h2 style="margin-top:0; font-size:1.05rem;">Submit a new template</h2>
         <form method="post" action="/admin/templates">
+            <div class="field">
+                <label for="business_id">Business</label>
+                <select name="business_id" id="business_id">
+                    {% for b in businesses %}
+                    <option value="{{ b.id }}">{{ b.display_name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
             <div class="field">
                 <label for="name">Name</label>
                 <input type="text" name="name" id="name" required placeholder="e.g. weve_reopened">

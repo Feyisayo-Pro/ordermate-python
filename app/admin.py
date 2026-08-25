@@ -91,6 +91,12 @@ def orders_dashboard(request: Request, db: Session = Depends(get_db), _admin: No
     )
 
 
+@router.get("/appointments", response_class=HTMLResponse)
+def appointments_dashboard(request: Request, db: Session = Depends(get_db), _admin: None = Depends(require_admin)):
+    appointments = db.query(models.Appointment).order_by(models.Appointment.created_at.desc()).limit(100).all()
+    return templates.TemplateResponse(request, "admin_appointments.html", {"appointments": appointments})
+
+
 @router.post("/orders/{order_ref}/status")
 def update_status(
     order_ref: str,
@@ -112,12 +118,22 @@ BROADCAST_AUDIENCES = {
 }
 
 
-def _eligible_customers(db: Session, audience: str) -> list[models.Customer]:
-    query = db.query(models.Customer).filter(models.Customer.opted_out.is_(False))
+def _eligible_customers(db: Session, business: models.Business, audience: str) -> list[models.Customer]:
+    # Scoped to ONE business — a customer currently exploring the salon demo
+    # shouldn't get a "Mama's Kitchen is open" broadcast, and vice versa (see
+    # models.py's Customer docstring on business_id being "who they're
+    # talking to right now," not a permanent identity).
+    query = db.query(models.Customer).filter(
+        models.Customer.business_id == business.id, models.Customer.opted_out.is_(False),
+    )
     if settings.OWNER_WHATSAPP_NUMBER:
         query = query.filter(models.Customer.phone != settings.OWNER_WHATSAPP_NUMBER)
     if audience == "customers":
-        query = query.join(models.Order).distinct()
+        # "Has transacted at least once" — which table that means depends on
+        # the business's vertical (Order for food_ordering, Appointment for
+        # appointment_booking).
+        join_model = models.Appointment if business.vertical == "appointment_booking" else models.Order
+        query = query.join(join_model).distinct()
     return query.all()
 
 
@@ -129,8 +145,15 @@ def _split_by_window(customers: list[models.Customer]) -> tuple[list[models.Cust
     return in_window, outside_window
 
 
-def _approved_templates(db: Session) -> list[models.MessageTemplate]:
-    return db.query(models.MessageTemplate).filter_by(status="APPROVED").order_by(models.MessageTemplate.name).all()
+def _approved_templates(db: Session, business_id: int) -> list[models.MessageTemplate]:
+    return db.query(models.MessageTemplate).filter_by(status="APPROVED", business_id=business_id).order_by(models.MessageTemplate.name).all()
+
+
+def _get_business_or_400(db: Session, business_id: int) -> models.Business:
+    business = db.get(models.Business, business_id)
+    if not business:
+        raise HTTPException(status_code=400, detail="Invalid business")
+    return business
 
 
 @router.get("/broadcast", response_class=HTMLResponse)
@@ -142,15 +165,20 @@ def broadcast_compose(
     result = None
     if sent is not None:
         result = {"sent": sent, "failed": failed or 0, "skipped": skipped or 0}
+    all_businesses = db.query(models.Business).order_by(models.Business.id).all()
     return templates.TemplateResponse(
         request, "admin_broadcast.html",
-        {"audiences": BROADCAST_AUDIENCES, "result": result, "approved_templates": _approved_templates(db)},
+        {
+            "audiences": BROADCAST_AUDIENCES, "result": result, "businesses": all_businesses,
+            "approved_templates_by_business": {b.id: _approved_templates(db, b.id) for b in all_businesses},
+        },
     )
 
 
 @router.post("/broadcast/preview", response_class=HTMLResponse)
 def broadcast_preview(
     request: Request,
+    business_id: int = Form(...),
     method: str = Form(...),  # "text" or "template:<id>"
     message: str = Form(""),
     audience: str = Form(...),
@@ -159,7 +187,8 @@ def broadcast_preview(
 ):
     if audience not in BROADCAST_AUDIENCES:
         raise HTTPException(status_code=400, detail="Invalid audience")
-    eligible = _eligible_customers(db, audience)
+    business = _get_business_or_400(db, business_id)
+    eligible = _eligible_customers(db, business, audience)
 
     if method == "text":
         if not message.strip():
@@ -168,6 +197,7 @@ def broadcast_preview(
         return templates.TemplateResponse(
             request, "admin_broadcast_preview.html",
             {
+                "business_id": business.id, "business_name": business.display_name,
                 "method": "text", "message": message, "audience": audience,
                 "audience_label": BROADCAST_AUDIENCES[audience],
                 "in_window_count": len(in_window), "outside_window_count": len(outside_window),
@@ -177,7 +207,7 @@ def broadcast_preview(
 
     template_id = method.removeprefix("template:")
     tpl = db.get(models.MessageTemplate, int(template_id)) if template_id.isdigit() else None
-    if not tpl or tpl.status != "APPROVED":
+    if not tpl or tpl.status != "APPROVED" or tpl.business_id != business.id:
         raise HTTPException(status_code=400, detail="Template not found or not approved")
     # Template messages aren't limited by the 24h window at all — that's the
     # whole point of using one — so every eligible (opted-in, non-owner)
@@ -185,6 +215,7 @@ def broadcast_preview(
     return templates.TemplateResponse(
         request, "admin_broadcast_preview.html",
         {
+            "business_id": business.id, "business_name": business.display_name,
             "method": f"template:{tpl.id}", "message": tpl.body_text, "audience": audience,
             "audience_label": BROADCAST_AUDIENCES[audience],
             "in_window_count": len(eligible), "outside_window_count": 0,
@@ -195,6 +226,7 @@ def broadcast_preview(
 
 @router.post("/broadcast/send")
 def broadcast_send(
+    business_id: int = Form(...),
     method: str = Form(...),
     message: str = Form(""),
     audience: str = Form(...),
@@ -203,7 +235,8 @@ def broadcast_send(
 ):
     if audience not in BROADCAST_AUDIENCES:
         raise HTTPException(status_code=400, detail="Invalid audience")
-    eligible = _eligible_customers(db, audience)
+    business = _get_business_or_400(db, business_id)
+    eligible = _eligible_customers(db, business, audience)
 
     if method == "text":
         in_window, outside_window = _split_by_window(eligible)
@@ -213,7 +246,7 @@ def broadcast_send(
     else:
         template_id = method.removeprefix("template:")
         tpl = db.get(models.MessageTemplate, int(template_id)) if template_id.isdigit() else None
-        if not tpl or tpl.status != "APPROVED":
+        if not tpl or tpl.status != "APPROVED" or tpl.business_id != business.id:
             raise HTTPException(status_code=400, detail="Template not found or not approved")
         sent = sum(
             1 for c in eligible
@@ -231,14 +264,16 @@ def broadcast_send(
 @router.get("/templates", response_class=HTMLResponse)
 def templates_list(request: Request, db: Session = Depends(get_db), _admin: None = Depends(require_admin)):
     rows = db.query(models.MessageTemplate).order_by(models.MessageTemplate.created_at.desc()).all()
+    all_businesses = db.query(models.Business).order_by(models.Business.id).all()
     return templates.TemplateResponse(
         request, "admin_templates.html",
-        {"templates": rows, "configured": settings.template_management_configured},
+        {"templates": rows, "businesses": all_businesses, "configured": settings.template_management_configured},
     )
 
 
 @router.post("/templates")
 def templates_create(
+    business_id: int = Form(...),
     name: str = Form(...),
     body_text: str = Form(...),
     db: Session = Depends(get_db),
@@ -246,6 +281,7 @@ def templates_create(
 ):
     if not settings.template_management_configured:
         raise HTTPException(status_code=503, detail="Set WHATSAPP_BUSINESS_ACCOUNT_ID to submit templates")
+    business = _get_business_or_400(db, business_id)
     # Meta requires lowercase letters, numbers, and underscores only.
     clean_name = re.sub(r"[^a-z0-9_]", "", name.strip().lower().replace(" ", "_"))
     if not clean_name:
@@ -258,7 +294,7 @@ def templates_create(
         raise HTTPException(status_code=502, detail="Meta rejected the template — check the name/body and try again")
 
     db.add(models.MessageTemplate(
-        name=clean_name, body_text=body_text, has_variable="{{1}}" in body_text,
+        business_id=business.id, name=clean_name, body_text=body_text, has_variable="{{1}}" in body_text,
         status=result.get("status", "PENDING"),
     ))
     db.commit()
