@@ -1,6 +1,8 @@
 import hashlib
 import hmac
+import logging
 
+from app import whatsapp_client
 from app.whatsapp_client import (
     verify_webhook_signature,
     extract_incoming_message,
@@ -8,6 +10,9 @@ from app.whatsapp_client import (
     send_list_menu,
     send_button_menu,
     download_media,
+    create_message_template,
+    get_message_template_status,
+    send_template_message,
     ListMenu,
     ListMenuSection,
     ListMenuRow,
@@ -185,3 +190,117 @@ def test_download_media_is_noop_in_dry_run_mode():
     assert settings.whatsapp_configured is False
     # No credentials configured -> no real API call is attempted
     assert download_media("media.abc123") is None
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_create_message_template_returns_none_when_not_configured():
+    settings = get_settings()
+    assert settings.template_management_configured is False
+    assert create_message_template("promo_template", "Hi there!") is None
+
+
+def test_create_message_template_submits_the_correct_payload(monkeypatch):
+    settings = get_settings()
+    settings.WHATSAPP_ACCESS_TOKEN = "fake-token"
+    settings.WHATSAPP_BUSINESS_ACCOUNT_ID = "waba-123"
+    captured = {}
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return _FakeResponse({"id": "999", "status": "PENDING", "category": "MARKETING"})
+
+    monkeypatch.setattr(whatsapp_client.httpx, "post", fake_post)
+    try:
+        result = create_message_template("hello_template", "Hi {{1}}, we're open!")
+        assert result == {"id": "999", "status": "PENDING", "category": "MARKETING"}
+        assert captured["url"] == "https://graph.facebook.com/v21.0/waba-123/message_templates"
+        assert captured["json"]["name"] == "hello_template"
+        assert captured["json"]["category"] == "MARKETING"
+        assert captured["json"]["components"] == [{"type": "BODY", "text": "Hi {{1}}, we're open!"}]
+    finally:
+        settings.WHATSAPP_ACCESS_TOKEN = ""
+        settings.WHATSAPP_BUSINESS_ACCOUNT_ID = ""
+
+
+def test_get_message_template_status_returns_none_when_not_configured():
+    settings = get_settings()
+    assert settings.template_management_configured is False
+    assert get_message_template_status("promo_template") is None
+
+
+def test_get_message_template_status_finds_the_matching_language(monkeypatch):
+    settings = get_settings()
+    settings.WHATSAPP_ACCESS_TOKEN = "fake-token"
+    settings.WHATSAPP_BUSINESS_ACCOUNT_ID = "waba-123"
+
+    def fake_get(url, headers, params, timeout):
+        return _FakeResponse({"data": [
+            {"name": "promo_template", "language": "fr", "status": "REJECTED"},
+            {"name": "promo_template", "language": "en_US", "status": "APPROVED"},
+        ]})
+
+    monkeypatch.setattr(whatsapp_client.httpx, "get", fake_get)
+    try:
+        assert get_message_template_status("promo_template", "en_US") == "APPROVED"
+    finally:
+        settings.WHATSAPP_ACCESS_TOKEN = ""
+        settings.WHATSAPP_BUSINESS_ACCOUNT_ID = ""
+
+
+def test_send_template_message_is_dry_run_logged_when_not_configured(caplog):
+    settings = get_settings()
+    assert settings.whatsapp_configured is False
+    with caplog.at_level(logging.INFO):
+        assert send_template_message("234801", "promo_template", "en_US", "Tolu") is True
+    assert any("[TEMPLATE promo_template]" in r.message for r in caplog.records)
+
+
+def test_send_template_message_omits_components_when_no_variable(monkeypatch):
+    settings = get_settings()
+    settings.WHATSAPP_ACCESS_TOKEN = "fake-token"
+    settings.WHATSAPP_PHONE_NUMBER_ID = "123456"
+    captured = {}
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return _FakeResponse({})
+
+    monkeypatch.setattr(whatsapp_client.httpx, "post", fake_post)
+    try:
+        assert send_template_message("234801", "promo_template", "en_US", None) is True
+        assert "components" not in captured["json"]["template"]
+    finally:
+        settings.WHATSAPP_ACCESS_TOKEN = ""
+        settings.WHATSAPP_PHONE_NUMBER_ID = ""
+
+
+def test_send_template_message_includes_the_variable_when_given(monkeypatch):
+    settings = get_settings()
+    settings.WHATSAPP_ACCESS_TOKEN = "fake-token"
+    settings.WHATSAPP_PHONE_NUMBER_ID = "123456"
+    captured = {}
+
+    def fake_post(url, headers, json, timeout):
+        captured["json"] = json
+        return _FakeResponse({})
+
+    monkeypatch.setattr(whatsapp_client.httpx, "post", fake_post)
+    try:
+        assert send_template_message("234801", "promo_template", "en_US", "Tolu") is True
+        assert captured["json"]["template"]["components"] == [
+            {"type": "body", "parameters": [{"type": "text", "text": "Tolu"}]}
+        ]
+    finally:
+        settings.WHATSAPP_ACCESS_TOKEN = ""
+        settings.WHATSAPP_PHONE_NUMBER_ID = ""

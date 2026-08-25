@@ -310,3 +310,92 @@ def extract_incoming_message(payload: dict) -> dict | None:
         }
     except (KeyError, IndexError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Message templates — the only way to message a customer outside WhatsApp's
+# 24h reply window (used by app/admin.py's broadcast + /templates routes).
+# Meta requires every template to go through their own review before it can
+# be used; nothing here can skip or speed that up. WHATSAPP_BUSINESS_ACCOUNT_ID
+# (distinct from WHATSAPP_PHONE_NUMBER_ID) is required for the create/status
+# calls, since templates belong to the WABA, not to a specific phone number.
+# ---------------------------------------------------------------------------
+
+def create_message_template(name: str, body_text: str, language: str = "en_US") -> dict | None:
+    """
+    Submits a new template for Meta's review. body_text may include exactly
+    one {{1}} placeholder (the caller decides what to fill it with at send
+    time — see send_template_message). Returns Meta's response dict
+    (typically {"id":..., "status": "PENDING", "category": "MARKETING"}) on
+    success, or None if template management isn't configured or the request
+    fails — never raises, matching this module's other functions.
+    """
+    if not settings.template_management_configured:
+        log.warning("WHATSAPP_BUSINESS_ACCOUNT_ID not set — can't submit a message template")
+        return None
+
+    url = f"{GRAPH_API_BASE}/{settings.WHATSAPP_BUSINESS_ACCOUNT_ID}/message_templates"
+    headers = {"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN}"}
+    payload = {
+        "name": name,
+        "language": language,
+        "category": "MARKETING",
+        "components": [{"type": "BODY", "text": body_text}],
+    }
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError:
+        log.exception("Failed to submit message template %r", name)
+        return None
+
+
+def get_message_template_status(name: str, language: str = "en_US") -> str | None:
+    """Re-checks a submitted template's current review status with Meta. Returns
+    None if template management isn't configured, the template isn't found, or
+    the request fails."""
+    if not settings.template_management_configured:
+        return None
+
+    url = f"{GRAPH_API_BASE}/{settings.WHATSAPP_BUSINESS_ACCOUNT_ID}/message_templates"
+    headers = {"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN}"}
+    try:
+        resp = httpx.get(url, headers=headers, params={"name": name}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        match = next((t for t in data.get("data", []) if t.get("language") == language), None)
+        return match.get("status") if match else None
+    except httpx.HTTPError:
+        log.exception("Failed to check status of message template %r", name)
+        return None
+
+
+def send_template_message(to_phone: str, name: str, language: str, variable: str | None) -> bool:
+    """
+    Sends an approved template message — the only compliant way to reach a
+    customer outside WhatsApp's 24h reply window. Mirrors send_message's
+    dry-run/error-handling behavior exactly.
+    """
+    if not settings.whatsapp_configured:
+        log.info("[DRY_RUN] -> %s: [TEMPLATE %s] variable=%r", to_phone, name, variable)
+        return True
+
+    url = f"{GRAPH_API_BASE}/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN}"}
+    template: dict = {"name": name, "language": {"code": language}}
+    if variable is not None:
+        template["components"] = [{"type": "body", "parameters": [{"type": "text", "text": variable}]}]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "template",
+        "template": template,
+    }
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=10)
+        resp.raise_for_status()
+        return True
+    except httpx.HTTPError:
+        log.exception("Failed to send template message %r to %s", name, to_phone)
+        return False

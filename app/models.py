@@ -115,3 +115,23 @@ class Feedback(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     order: Mapped["Order"] = relationship(back_populates="feedback")
+
+
+class MessageTemplate(Base):
+    """
+    A WhatsApp message template submitted for Meta's approval (app/admin.py's
+    /templates routes) — the only way to message a customer outside
+    WhatsApp's 24h reply window (see app/admin.py's broadcast routes).
+    status starts "PENDING" and is only ever updated by explicitly re-checking
+    with Meta (there's no webhook wired up for template status changes), so
+    it can go stale between checks — treat it as "as of the last refresh."
+    """
+    __tablename__ = "message_templates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    language: Mapped[str] = mapped_column(String(10), default="en_US")
+    body_text: Mapped[str] = mapped_column(Text)
+    has_variable: Mapped[bool] = mapped_column(default=False)
+    status: Mapped[str] = mapped_column(String(32), default="PENDING")  # PENDING | APPROVED | REJECTED
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

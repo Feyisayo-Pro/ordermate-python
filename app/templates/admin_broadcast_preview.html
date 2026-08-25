@@ -23,18 +23,22 @@
 </head>
 <body>
     <h1>Confirm broadcast</h1>
-    <p class="sub">Sending to: {{ audience_label }}</p>
+    <p class="sub">
+        Sending to: {{ audience_label }}
+        {% if template_name %}&middot; via approved template <strong>{{ template_name }}</strong>{% endif %}
+    </p>
 
     <div class="card">
         <div class="preview">{{ message }}</div>
         <div class="counts">
             <div class="will-send">{{ in_window_count }} customer(s) will receive this now.</div>
             {% if outside_window_count %}
-            <div class="will-skip">{{ outside_window_count }} customer(s) will be skipped — outside WhatsApp's {{ window_hours }}h reply window, and there's no approved message template to reach them instead.</div>
+            <div class="will-skip">{{ outside_window_count }} customer(s) will be skipped — outside WhatsApp's {{ window_hours }}h reply window, and there's no approved message template selected to reach them instead.</div>
             {% endif %}
         </div>
         <div class="actions">
             <form method="post" action="/admin/broadcast/send">
+                <input type="hidden" name="method" value="{{ method }}">
                 <input type="hidden" name="message" value="{{ message }}">
                 <input type="hidden" name="audience" value="{{ audience }}">
                 <button type="submit">Confirm &amp; send</button>

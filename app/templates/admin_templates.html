@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>OrderMate — Templates</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; background: #f6f6f4; color: #222; }
+        h1 { margin-bottom: 0.25rem; }
+        p.sub { color: #666; margin-top: 0; margin-bottom: 1.5rem; }
+        a.nav { color: #444; font-size: 0.85rem; text-decoration: none; }
+        a.nav:hover { text-decoration: underline; }
+        table { width: 100%; max-width: 720px; border-collapse: collapse; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-radius: 6px; overflow: hidden; margin-bottom: 2rem; }
+        th, td { text-align: left; padding: 0.65rem 0.9rem; border-bottom: 1px solid #eee; font-size: 0.85rem; vertical-align: top; }
+        th { background: #fafafa; font-weight: 600; color: #444; }
+        tr:last-child td { border-bottom: none; }
+        .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+        .badge-PENDING { background: #fff3cd; color: #7a5c00; }
+        .badge-APPROVED { background: #d4f4e2; color: #0f6b3f; }
+        .badge-REJECTED { background: #fde0e0; color: #a02020; }
+        .empty { padding: 1.5rem; text-align: center; color: #888; max-width: 720px; }
+        .card { max-width: 520px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-radius: 6px; padding: 1.5rem; }
+        label { display: block; font-weight: 600; margin-bottom: 0.35rem; font-size: 0.9rem; }
+        input[type=text], textarea { width: 100%; padding: 0.6rem; border-radius: 4px; border: 1px solid #ccc; font-size: 0.9rem; font-family: inherit; box-sizing: border-box; }
+        textarea { min-height: 90px; }
+        .field { margin-bottom: 1rem; }
+        .hint { color: #888; font-size: 0.8rem; margin-top: 0.3rem; }
+        button { padding: 0.5rem 0.9rem; border-radius: 4px; border: 1px solid #333; background: #222; color: white; cursor: pointer; font-size: 0.85rem; }
+        button:hover { background: #444; }
+        button.refresh { background: white; color: #222; }
+        .warn { background: #fde0e0; color: #a02020; padding: 0.9rem 1rem; border-radius: 6px; max-width: 720px; margin-bottom: 1.5rem; font-size: 0.88rem; }
+    </style>
+</head>
+<body>
+    <p><a class="nav" href="/admin/broadcast">&larr; Broadcast</a></p>
+    <h1>📋 Message templates</h1>
+    <p class="sub">Meta must approve a template before it can reach customers outside the 24h reply window — this can take anywhere from minutes to about a day.</p>
+
+    {% if not configured %}
+    <div class="warn">WHATSAPP_BUSINESS_ACCOUNT_ID isn't set — find it in Meta Business Manager under WhatsApp Manager &gt; API Setup, then add it to submit templates.</div>
+    {% endif %}
+
+    <table>
+        <thead>
+            <tr><th>Name</th><th>Body</th><th>Status</th><th>Submitted</th><th></th></tr>
+        </thead>
+        <tbody>
+        {% for t in templates %}
+            <tr>
+                <td><strong>{{ t.name }}</strong></td>
+                <td>{{ t.body_text }}</td>
+                <td><span class="badge badge-{{ t.status }}">{{ t.status }}</span></td>
+                <td>{{ t.created_at.strftime("%b %d, %H:%M") }}</td>
+                <td>
+                    <form method="post" action="/admin/templates/{{ t.id }}/refresh">
+                        <button class="refresh" type="submit">Check status</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="5" class="empty">No templates submitted yet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="card">
+        <h2 style="margin-top:0; font-size:1.05rem;">Submit a new template</h2>
+        <form method="post" action="/admin/templates">
+            <div class="field">
+                <label for="name">Name</label>
+                <input type="text" name="name" id="name" required placeholder="e.g. weve_reopened">
+                <p class="hint">Lowercase letters, numbers, and underscores only — spaces get converted automatically.</p>
+            </div>
+            <div class="field">
+                <label for="body_text">Body</label>
+                <textarea name="body_text" id="body_text" required placeholder="Hi {% raw %}{{1}}{% endraw %}, we're open again today from 10am — same menu, same number 🍲"></textarea>
+                <p class="hint">Optional: include {% raw %}{{1}}{% endraw %} once to personalize with the customer's name.</p>
+            </div>
+            <button type="submit">Submit for approval</button>
+        </form>
+    </div>
+</body>
+</html>

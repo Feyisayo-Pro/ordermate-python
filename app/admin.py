@@ -42,6 +42,7 @@ BROADCAST SECURITY/COMPLIANCE NOTE (see the /broadcast routes below):
 from __future__ import annotations
 
 import hmac
+import re
 from datetime import datetime, timedelta, timezone
 
 # pyrefly: ignore [missing-import]
@@ -58,7 +59,7 @@ from sqlalchemy.orm import Session
 from app import conversation, models
 from app.config import get_settings
 from app.database import get_db
-from app.whatsapp_client import send_message
+from app.whatsapp_client import create_message_template, get_message_template_status, send_message, send_template_message
 
 settings = get_settings()
 templates = Jinja2Templates(directory="app/templates")
@@ -128,53 +129,149 @@ def _split_by_window(customers: list[models.Customer]) -> tuple[list[models.Cust
     return in_window, outside_window
 
 
+def _approved_templates(db: Session) -> list[models.MessageTemplate]:
+    return db.query(models.MessageTemplate).filter_by(status="APPROVED").order_by(models.MessageTemplate.name).all()
+
+
 @router.get("/broadcast", response_class=HTMLResponse)
-def broadcast_compose(request: Request, sent: int | None = None, failed: int | None = None, skipped: int | None = None, _admin: None = Depends(require_admin)):
+def broadcast_compose(
+    request: Request,
+    sent: int | None = None, failed: int | None = None, skipped: int | None = None,
+    db: Session = Depends(get_db), _admin: None = Depends(require_admin),
+):
     result = None
     if sent is not None:
         result = {"sent": sent, "failed": failed or 0, "skipped": skipped or 0}
-    return templates.TemplateResponse(request, "admin_broadcast.html", {"audiences": BROADCAST_AUDIENCES, "result": result})
+    return templates.TemplateResponse(
+        request, "admin_broadcast.html",
+        {"audiences": BROADCAST_AUDIENCES, "result": result, "approved_templates": _approved_templates(db)},
+    )
 
 
 @router.post("/broadcast/preview", response_class=HTMLResponse)
 def broadcast_preview(
     request: Request,
-    message: str = Form(...),
+    method: str = Form(...),  # "text" or "template:<id>"
+    message: str = Form(""),
     audience: str = Form(...),
     db: Session = Depends(get_db),
     _admin: None = Depends(require_admin),
 ):
     if audience not in BROADCAST_AUDIENCES:
         raise HTTPException(status_code=400, detail="Invalid audience")
-    if not message.strip():
-        raise HTTPException(status_code=400, detail="Message can't be empty")
-    in_window, outside_window = _split_by_window(_eligible_customers(db, audience))
+    eligible = _eligible_customers(db, audience)
+
+    if method == "text":
+        if not message.strip():
+            raise HTTPException(status_code=400, detail="Message can't be empty")
+        in_window, outside_window = _split_by_window(eligible)
+        return templates.TemplateResponse(
+            request, "admin_broadcast_preview.html",
+            {
+                "method": "text", "message": message, "audience": audience,
+                "audience_label": BROADCAST_AUDIENCES[audience],
+                "in_window_count": len(in_window), "outside_window_count": len(outside_window),
+                "window_hours": BROADCAST_WINDOW_HOURS,
+            },
+        )
+
+    template_id = method.removeprefix("template:")
+    tpl = db.get(models.MessageTemplate, int(template_id)) if template_id.isdigit() else None
+    if not tpl or tpl.status != "APPROVED":
+        raise HTTPException(status_code=400, detail="Template not found or not approved")
+    # Template messages aren't limited by the 24h window at all — that's the
+    # whole point of using one — so every eligible (opted-in, non-owner)
+    # customer will actually receive it.
     return templates.TemplateResponse(
         request, "admin_broadcast_preview.html",
         {
-            "message": message,
-            "audience": audience,
+            "method": f"template:{tpl.id}", "message": tpl.body_text, "audience": audience,
             "audience_label": BROADCAST_AUDIENCES[audience],
-            "in_window_count": len(in_window),
-            "outside_window_count": len(outside_window),
-            "window_hours": BROADCAST_WINDOW_HOURS,
+            "in_window_count": len(eligible), "outside_window_count": 0,
+            "window_hours": BROADCAST_WINDOW_HOURS, "template_name": tpl.name,
         },
     )
 
 
 @router.post("/broadcast/send")
 def broadcast_send(
-    message: str = Form(...),
+    method: str = Form(...),
+    message: str = Form(""),
     audience: str = Form(...),
     db: Session = Depends(get_db),
     _admin: None = Depends(require_admin),
 ):
     if audience not in BROADCAST_AUDIENCES:
         raise HTTPException(status_code=400, detail="Invalid audience")
-    in_window, outside_window = _split_by_window(_eligible_customers(db, audience))
-    sent = sum(1 for c in in_window if send_message(c.phone, message))
-    failed = len(in_window) - sent
+    eligible = _eligible_customers(db, audience)
+
+    if method == "text":
+        in_window, outside_window = _split_by_window(eligible)
+        sent = sum(1 for c in in_window if send_message(c.phone, message))
+        failed = len(in_window) - sent
+        skipped = len(outside_window)
+    else:
+        template_id = method.removeprefix("template:")
+        tpl = db.get(models.MessageTemplate, int(template_id)) if template_id.isdigit() else None
+        if not tpl or tpl.status != "APPROVED":
+            raise HTTPException(status_code=400, detail="Template not found or not approved")
+        sent = sum(
+            1 for c in eligible
+            if send_template_message(c.phone, tpl.name, tpl.language, c.name if tpl.has_variable and c.name else None)
+        )
+        failed = len(eligible) - sent
+        skipped = 0
+
     return RedirectResponse(
-        url=f"/admin/broadcast?sent={sent}&failed={failed}&skipped={len(outside_window)}",
+        url=f"/admin/broadcast?sent={sent}&failed={failed}&skipped={skipped}",
         status_code=303,
     )
+
+
+@router.get("/templates", response_class=HTMLResponse)
+def templates_list(request: Request, db: Session = Depends(get_db), _admin: None = Depends(require_admin)):
+    rows = db.query(models.MessageTemplate).order_by(models.MessageTemplate.created_at.desc()).all()
+    return templates.TemplateResponse(
+        request, "admin_templates.html",
+        {"templates": rows, "configured": settings.template_management_configured},
+    )
+
+
+@router.post("/templates")
+def templates_create(
+    name: str = Form(...),
+    body_text: str = Form(...),
+    db: Session = Depends(get_db),
+    _admin: None = Depends(require_admin),
+):
+    if not settings.template_management_configured:
+        raise HTTPException(status_code=503, detail="Set WHATSAPP_BUSINESS_ACCOUNT_ID to submit templates")
+    # Meta requires lowercase letters, numbers, and underscores only.
+    clean_name = re.sub(r"[^a-z0-9_]", "", name.strip().lower().replace(" ", "_"))
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Invalid template name")
+    if not body_text.strip():
+        raise HTTPException(status_code=400, detail="Template body can't be empty")
+
+    result = create_message_template(clean_name, body_text)
+    if result is None:
+        raise HTTPException(status_code=502, detail="Meta rejected the template — check the name/body and try again")
+
+    db.add(models.MessageTemplate(
+        name=clean_name, body_text=body_text, has_variable="{{1}}" in body_text,
+        status=result.get("status", "PENDING"),
+    ))
+    db.commit()
+    return RedirectResponse(url="/admin/templates", status_code=303)
+
+
+@router.post("/templates/{template_id}/refresh")
+def templates_refresh(template_id: int, db: Session = Depends(get_db), _admin: None = Depends(require_admin)):
+    tpl = db.get(models.MessageTemplate, template_id)
+    if not tpl:
+        raise HTTPException(status_code=404, detail="Template not found")
+    status = get_message_template_status(tpl.name, tpl.language)
+    if status:
+        tpl.status = status
+        db.commit()
+    return RedirectResponse(url="/admin/templates", status_code=303)

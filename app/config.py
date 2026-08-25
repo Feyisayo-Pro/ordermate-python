@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     WHATSAPP_PHONE_NUMBER_ID: str = ""
     WHATSAPP_APP_SECRET: str = ""          # used to verify incoming webhook signatures
     WHATSAPP_VERIFY_TOKEN: str = "ordermate_verify_me"  # you choose this; must match Meta dashboard
+    # The WhatsApp Business Account ID — NOT the same as WHATSAPP_PHONE_NUMBER_ID.
+    # Find it in Meta Business Manager under WhatsApp Manager > API Setup. Only
+    # needed for creating/checking message templates (app/admin.py's /templates
+    # routes) — ordinary sending/receiving doesn't use it.
+    WHATSAPP_BUSINESS_ACCOUNT_ID: str = ""
 
     # --- Anthropic (optional in dev) ---
     # Without this, the app falls back to a simple rule-based intent/order parser
@@ -85,6 +90,10 @@ class Settings(BaseSettings):
     @property
     def whatsapp_configured(self) -> bool:
         return bool(self.WHATSAPP_ACCESS_TOKEN and self.WHATSAPP_PHONE_NUMBER_ID)
+
+    @property
+    def template_management_configured(self) -> bool:
+        return bool(self.WHATSAPP_ACCESS_TOKEN and self.WHATSAPP_BUSINESS_ACCOUNT_ID)
 
     @property
     def anthropic_configured(self) -> bool:

@@ -191,7 +191,7 @@ def test_broadcast_preview_splits_by_24h_window(client, admin_auth, db_session):
 
     resp = client.post(
         "/admin/broadcast/preview",
-        data={"message": "We're open today!", "audience": "all"},
+        data={"method": "text", "message": "We're open today!", "audience": "all"},
         auth=admin_auth,
     )
     assert resp.status_code == 200
@@ -204,7 +204,7 @@ def test_broadcast_preview_excludes_opted_out_customers(client, admin_auth, db_s
 
     resp = client.post(
         "/admin/broadcast/preview",
-        data={"message": "Hello!", "audience": "all"},
+        data={"method": "text", "message": "Hello!", "audience": "all"},
         auth=admin_auth,
     )
     assert resp.status_code == 200
@@ -218,7 +218,7 @@ def test_broadcast_preview_excludes_the_owner_number(client, admin_auth, db_sess
         _make_customer(db_session, settings.OWNER_WHATSAPP_NUMBER, hours_since_last_message=1)
         resp = client.post(
             "/admin/broadcast/preview",
-            data={"message": "Hello!", "audience": "all"},
+            data={"method": "text", "message": "Hello!", "audience": "all"},
             auth=admin_auth,
         )
         assert "0 customer(s) will receive this now" in resp.text
@@ -232,7 +232,7 @@ def test_broadcast_customers_audience_only_includes_those_with_an_order(client, 
 
     resp = client.post(
         "/admin/broadcast/preview",
-        data={"message": "Thanks for ordering!", "audience": "customers"},
+        data={"method": "text", "message": "Thanks for ordering!", "audience": "customers"},
         auth=admin_auth,
     )
     assert "1 customer(s) will receive this now" in resp.text
@@ -247,7 +247,7 @@ def test_broadcast_send_only_messages_in_window_customers_and_reports_counts(cli
     with caplog.at_level(logging.INFO):
         resp = client.post(
             "/admin/broadcast/send",
-            data={"message": "We're open today!", "audience": "all"},
+            data={"method": "text", "message": "We're open today!", "audience": "all"},
             auth=admin_auth,
             follow_redirects=False,
         )
@@ -259,7 +259,102 @@ def test_broadcast_send_only_messages_in_window_customers_and_reports_counts(cli
 
 
 def test_broadcast_requires_admin_credentials(client, admin_auth, db_session):
-    resp = client.post("/admin/broadcast/preview", data={"message": "hi", "audience": "all"})
+    resp = client.post("/admin/broadcast/preview", data={"method": "text", "message": "hi", "audience": "all"})
     assert resp.status_code == 401
-    resp = client.post("/admin/broadcast/send", data={"message": "hi", "audience": "all"})
+    resp = client.post("/admin/broadcast/send", data={"method": "text", "message": "hi", "audience": "all"})
     assert resp.status_code == 401
+
+
+def _make_approved_template(db_session, name="reopen_promo", has_variable=True):
+    tpl = models.MessageTemplate(
+        name=name, language="en_US", body_text="Hi {{1}}, we're open again!" if has_variable else "We're open again!",
+        has_variable=has_variable, status="APPROVED",
+    )
+    db_session.add(tpl)
+    db_session.commit()
+    return tpl
+
+
+def test_templates_page_loads(client, admin_auth):
+    resp = client.get("/admin/templates", auth=admin_auth)
+    assert resp.status_code == 200
+    assert "templates" in resp.text.lower()
+
+
+def test_creating_a_template_submits_it_and_stores_the_result(client, admin_auth, monkeypatch):
+    settings = get_settings()
+    settings.WHATSAPP_ACCESS_TOKEN = "fake-token"
+    settings.WHATSAPP_BUSINESS_ACCOUNT_ID = "waba-123"
+    monkeypatch.setattr(
+        "app.admin.create_message_template",
+        lambda name, body_text: {"id": "1", "status": "PENDING", "category": "MARKETING"},
+    )
+    try:
+        resp = client.post(
+            "/admin/templates",
+            data={"name": "We're Open Again", "body_text": "Hi {{1}}, we're back!"},
+            auth=admin_auth,
+            follow_redirects=False,
+        )
+        assert resp.status_code == 303
+    finally:
+        settings.WHATSAPP_ACCESS_TOKEN = ""
+        settings.WHATSAPP_BUSINESS_ACCOUNT_ID = ""
+
+    resp = client.get("/admin/templates", auth=admin_auth)
+    assert "were_open_again" in resp.text  # sanitized: lowercase, spaces->underscores, apostrophe stripped
+    assert "PENDING" in resp.text
+
+
+def test_creating_a_template_requires_business_account_id_configured(client, admin_auth):
+    settings = get_settings()
+    assert settings.template_management_configured is False
+    resp = client.post(
+        "/admin/templates", data={"name": "promo", "body_text": "Hello!"}, auth=admin_auth,
+    )
+    assert resp.status_code == 503
+
+
+def test_refreshing_a_template_status_updates_it(client, admin_auth, db_session, monkeypatch):
+    tpl = models.MessageTemplate(name="promo", language="en_US", body_text="Hello!", status="PENDING")
+    db_session.add(tpl)
+    db_session.commit()
+
+    monkeypatch.setattr("app.admin.get_message_template_status", lambda name, language: "APPROVED")
+    resp = client.post(f"/admin/templates/{tpl.id}/refresh", auth=admin_auth, follow_redirects=False)
+    assert resp.status_code == 303
+
+    db_session.refresh(tpl)
+    assert tpl.status == "APPROVED"
+
+
+def test_broadcast_preview_offers_approved_templates_and_ignores_the_24h_window(client, admin_auth, db_session):
+    _make_approved_template(db_session)
+    _make_customer(db_session, "2348011110008", hours_since_last_message=48)  # would be skipped for free-text
+
+    resp = client.post(
+        "/admin/broadcast/preview",
+        data={"method": "template:1", "audience": "all"},
+        auth=admin_auth,
+    )
+    assert resp.status_code == 200
+    assert "1 customer(s) will receive this now" in resp.text
+    assert "will be skipped" not in resp.text
+
+
+def test_broadcast_send_via_template_fills_in_the_customers_name(client, admin_auth, db_session, caplog):
+    import logging
+
+    _make_approved_template(db_session, has_variable=True)
+    _make_customer(db_session, "2348011110009", hours_since_last_message=48)
+
+    with caplog.at_level(logging.INFO):
+        resp = client.post(
+            "/admin/broadcast/send",
+            data={"method": "template:1", "audience": "all"},
+            auth=admin_auth,
+            follow_redirects=False,
+        )
+    assert resp.status_code == 303
+    assert "sent=1" in resp.headers["location"]
+    assert any("[TEMPLATE reopen_promo]" in r.message and "'Test'" in r.message for r in caplog.records)
