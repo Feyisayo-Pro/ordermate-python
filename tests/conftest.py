@@ -31,12 +31,46 @@ TestingSessionLocal = sessionmaker(bind=TEST_ENGINE, autoflush=False, autocommit
 # real ordermate.db file instead of the test database.
 database.SessionLocal = TestingSessionLocal
 
+# scheduler.py's persistent job store (SQLAlchemyJobStore) is built from
+# database.engine, read at start_scheduler() call time — override it too, for
+# the same reason as SessionLocal above, so it never touches the real
+# configured database. Deliberately a SEPARATE dedicated engine from
+# TEST_ENGINE (not the same one): APScheduler's background thread polls this
+# engine for due jobs on its own schedule, concurrently with whatever the
+# test/request thread is doing on TEST_ENGINE — sharing one StaticPool
+# connection between both caused real "cannot commit transaction: SQL
+# statements in progress" failures under SQLite. Postgres (production) has
+# no such issue since it supports genuine concurrent connections; this
+# split only exists to keep the test suite's SQLite backend deterministic.
+SCHEDULER_TEST_ENGINE = create_engine(
+    "sqlite:///:memory:",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+database.engine = SCHEDULER_TEST_ENGINE
+
 
 @pytest.fixture(autouse=True)
 def _reset_db():
     Base.metadata.create_all(bind=TEST_ENGINE)
     yield
     Base.metadata.drop_all(bind=TEST_ENGINE)
+
+
+@pytest.fixture(autouse=True)
+def _reset_scheduler_jobs():
+    """
+    The job store now persists jobs in the database (see app/scheduler.py) —
+    without this, a job scheduled by one test (e.g. "abandoned-1") would
+    still be sitting in the (shared, session-lifetime) test engine's job
+    table on the next test, where autoincrement ids restart from 1 too,
+    causing cross-test interference that never happened with the old
+    in-memory-only job store.
+    """
+    from app.scheduler import scheduler
+    yield
+    if scheduler.running:
+        scheduler.remove_all_jobs()
 
 
 #: Settings fields that must never leak from the developer's local .env into
