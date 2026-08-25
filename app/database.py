@@ -37,3 +37,34 @@ def init_db():
     # Imported here (not at module top) to avoid a circular import with models.py
     from app import models  # noqa: F401
     Base.metadata.create_all(bind=engine)
+    _add_missing_columns()
+
+
+def _add_missing_columns():
+    """
+    create_all() only creates missing TABLES — it never alters a table that
+    already exists, so adding a new column to an existing model (as opposed
+    to a whole new table like OrderItem) needs its own handling here. There's
+    no migration framework in this project (deliberately, for a single-
+    business MVP — see models.py's own docstring), so this does the smallest
+    thing that's actually safe: inspect what columns really exist in the
+    live database and ALTER TABLE for exactly the ones missing. A no-op on a
+    fresh database, since create_all() already created every current column.
+    """
+    # pyrefly: ignore [missing-import]
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "customers" not in inspector.get_table_names():
+        return
+    existing = {c["name"] for c in inspector.get_columns("customers")}
+    statements = []
+    if "last_inbound_at" not in existing:
+        statements.append("ALTER TABLE customers ADD COLUMN last_inbound_at TIMESTAMP")
+    if "opted_out" not in existing:
+        statements.append("ALTER TABLE customers ADD COLUMN opted_out BOOLEAN DEFAULT FALSE")
+    if not statements:
+        return
+    with engine.begin() as conn:
+        for stmt in statements:
+            conn.execute(text(stmt))

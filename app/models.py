@@ -27,6 +27,16 @@ class Customer(Base):
     phone: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(120), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Both used by broadcast messaging (app/admin.py): last_inbound_at decides
+    # whether a free-text broadcast can legally reach this customer at all —
+    # WhatsApp only allows free-form messages within 24h of their last
+    # message; outside that window only a pre-approved template message
+    # works, which this app doesn't send. opted_out lets a customer stop
+    # promotional messages (see conversation.py's opt-out check) without
+    # blocking order-related messages, which are a different message
+    # category under WhatsApp's own policy.
+    last_inbound_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    opted_out: Mapped[bool] = mapped_column(default=False)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="customer", uselist=False)
     orders: Mapped[list["Order"]] = relationship(back_populates="customer")

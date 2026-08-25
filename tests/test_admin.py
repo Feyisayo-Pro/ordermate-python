@@ -157,3 +157,109 @@ def test_status_update_requires_admin_credentials(client, admin_auth, db_session
     order = _make_order(db_session)
     resp = client.post(f"/admin/orders/{order.order_ref}/status", data={"new_status": "Preparing"})
     assert resp.status_code == 401
+
+
+def _make_customer(db_session, phone, hours_since_last_message=1, opted_out=False, with_order=False):
+    from datetime import datetime, timedelta, timezone
+
+    customer = models.Customer(
+        phone=phone, name="Test",
+        last_inbound_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours_since_last_message),
+        opted_out=opted_out,
+    )
+    db_session.add(customer)
+    db_session.flush()
+    db_session.add(models.Conversation(customer_id=customer.id, state="idle", draft_order="{}"))
+    if with_order:
+        db_session.add(models.Order(
+            order_ref=f"A-{phone[-4:]}", customer_id=customer.id, item="Jollof Rice + Chicken",
+            quantity=1, delivery_address="Somewhere", total_ngn=3500, status="Confirmed",
+        ))
+    db_session.commit()
+    return customer
+
+
+def test_broadcast_compose_page_loads(client, admin_auth):
+    resp = client.get("/admin/broadcast", auth=admin_auth)
+    assert resp.status_code == 200
+    assert "Broadcast" in resp.text
+
+
+def test_broadcast_preview_splits_by_24h_window(client, admin_auth, db_session):
+    _make_customer(db_session, "2348011110001", hours_since_last_message=2)   # in window
+    _make_customer(db_session, "2348011110002", hours_since_last_message=48)  # outside window
+
+    resp = client.post(
+        "/admin/broadcast/preview",
+        data={"message": "We're open today!", "audience": "all"},
+        auth=admin_auth,
+    )
+    assert resp.status_code == 200
+    assert "1 customer(s) will receive this now" in resp.text
+    assert "1 customer(s) will be skipped" in resp.text
+
+
+def test_broadcast_preview_excludes_opted_out_customers(client, admin_auth, db_session):
+    _make_customer(db_session, "2348011110003", hours_since_last_message=1, opted_out=True)
+
+    resp = client.post(
+        "/admin/broadcast/preview",
+        data={"message": "Hello!", "audience": "all"},
+        auth=admin_auth,
+    )
+    assert resp.status_code == 200
+    assert "0 customer(s) will receive this now" in resp.text
+
+
+def test_broadcast_preview_excludes_the_owner_number(client, admin_auth, db_session):
+    settings = get_settings()
+    settings.OWNER_WHATSAPP_NUMBER = "2348099999999"
+    try:
+        _make_customer(db_session, settings.OWNER_WHATSAPP_NUMBER, hours_since_last_message=1)
+        resp = client.post(
+            "/admin/broadcast/preview",
+            data={"message": "Hello!", "audience": "all"},
+            auth=admin_auth,
+        )
+        assert "0 customer(s) will receive this now" in resp.text
+    finally:
+        settings.OWNER_WHATSAPP_NUMBER = ""
+
+
+def test_broadcast_customers_audience_only_includes_those_with_an_order(client, admin_auth, db_session):
+    _make_customer(db_session, "2348011110004", hours_since_last_message=1, with_order=True)
+    _make_customer(db_session, "2348011110005", hours_since_last_message=1, with_order=False)
+
+    resp = client.post(
+        "/admin/broadcast/preview",
+        data={"message": "Thanks for ordering!", "audience": "customers"},
+        auth=admin_auth,
+    )
+    assert "1 customer(s) will receive this now" in resp.text
+
+
+def test_broadcast_send_only_messages_in_window_customers_and_reports_counts(client, admin_auth, db_session, caplog):
+    import logging
+
+    _make_customer(db_session, "2348011110006", hours_since_last_message=1)
+    _make_customer(db_session, "2348011110007", hours_since_last_message=48)
+
+    with caplog.at_level(logging.INFO):
+        resp = client.post(
+            "/admin/broadcast/send",
+            data={"message": "We're open today!", "audience": "all"},
+            auth=admin_auth,
+            follow_redirects=False,
+        )
+    assert resp.status_code == 303
+    assert "sent=1" in resp.headers["location"]
+    assert "skipped=1" in resp.headers["location"]
+    assert any("2348011110006" in r.message and "We're open today!" in r.message for r in caplog.records)
+    assert not any("2348011110007" in r.message and "We're open today!" in r.message for r in caplog.records)
+
+
+def test_broadcast_requires_admin_credentials(client, admin_auth, db_session):
+    resp = client.post("/admin/broadcast/preview", data={"message": "hi", "audience": "all"})
+    assert resp.status_code == 401
+    resp = client.post("/admin/broadcast/send", data={"message": "hi", "audience": "all"})
+    assert resp.status_code == 401

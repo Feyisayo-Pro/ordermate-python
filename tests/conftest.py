@@ -50,6 +50,21 @@ SCHEDULER_TEST_ENGINE = create_engine(
 database.engine = SCHEDULER_TEST_ENGINE
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _warm_up_scheduler():
+    """
+    Starting the scheduler now creates its jobstore's table (a real, if
+    small, one-time DB round trip) — paying that cost here, once, before any
+    test runs keeps it out of individual tests' wait_until() budgets. Without
+    this, whichever test happened to be the first in the process to use the
+    `client` fixture (triggering FastAPI's startup event) intermittently
+    raced a job scheduled with FEEDBACK_DELAY_SECONDS=0 against its own
+    scheduler's cold start.
+    """
+    from app.scheduler import start_scheduler
+    start_scheduler()
+
+
 @pytest.fixture(autouse=True)
 def _reset_db():
     Base.metadata.create_all(bind=TEST_ENGINE)

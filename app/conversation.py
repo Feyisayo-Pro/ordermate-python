@@ -50,7 +50,15 @@ def _get_or_create_customer(db: Session, phone: str, name: str) -> models.Custom
         db.flush()
     elif name and not customer.name:
         customer.name = name
+    # Drives broadcast messaging's 24h-window check (app/admin.py) — WhatsApp
+    # only allows a free-text message within 24h of the customer's last
+    # message, so this needs to reflect every real inbound message, not just
+    # ones that happen to change something else about the customer.
+    customer.last_inbound_at = datetime.now(timezone.utc)
     return customer
+
+
+_OPT_OUT_RE = re.compile(r"\b(unsubscribe|opt[ -]?out|stop messages?|remove me)\b", re.I)
 
 
 def _new_order_ref() -> str:
@@ -82,6 +90,18 @@ def handle_incoming_message(db: Session, phone: str, name: str, text: str) -> li
 
     customer = _get_or_create_customer(db, phone, name)
     convo = customer.conversation
+
+    if _OPT_OUT_RE.search(text):
+        # Checked globally, regardless of conversation state, and deliberately
+        # does NOT touch convo.state/draft_order — this only excludes the
+        # customer from future broadcast messages (app/admin.py), it doesn't
+        # cancel an order in progress or otherwise change what they're doing.
+        customer.opted_out = True
+        db.commit()
+        reply = "You've been unsubscribed from promotional messages 👍 You can still place orders and get order updates anytime."
+        send_message(phone, reply)
+        return [reply]
+
     replies: list[str] = []
 
     if convo.state == "awaiting_feedback":

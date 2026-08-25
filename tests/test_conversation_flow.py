@@ -262,6 +262,37 @@ def test_single_item_order_still_shows_the_original_confirmation_shape(client, c
     assert any("Order #A-" in r.message and "confirmed" in r.message for r in caplog.records)
 
 
+def test_saying_unsubscribe_opts_out_without_touching_conversation_state(client, db_session):
+    _send(client, "order")
+    _send(client, "Mains")
+
+    resp = _send(client, "please unsubscribe")
+    assert resp.status_code == 200
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    assert customer.opted_out is True
+    # order flow untouched — opting out of promos doesn't cancel an order in progress
+    assert customer.conversation.state == "ordering"
+
+
+def test_unsubscribe_does_not_collide_with_mid_order_cancel(client, db_session):
+    # "stop" alone still means "cancel this order" (existing behavior) —
+    # only an explicit unsubscribe-shaped phrase should opt someone out.
+    _send(client, "order")
+    _send(client, "Mains")
+    _send(client, "stop")
+
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    assert customer.conversation.state == "idle"  # cancelled, as before
+    assert customer.opted_out is False  # NOT treated as an unsubscribe
+
+
+def test_every_inbound_message_updates_last_inbound_at(client, db_session):
+    _send(client, "hi")
+    customer = db_session.query(models.Customer).filter_by(phone=PHONE).one()
+    assert customer.last_inbound_at is not None
+
+
 def test_ordinal_suffixes():
     assert _ordinal(1) == "1st"
     assert _ordinal(2) == "2nd"
