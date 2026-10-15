@@ -189,6 +189,6 @@ included). Whichever you choose:
   (`ANTHROPIC_API_KEY` set) for reliable understanding.
 - **Voice notes have no fallback.** Without `DEEPGRAM_API_KEY`, a voice note
   gets a "please type instead" reply.
-- **Not exercised against a live customer base.** The conversation flow is
-  covered by tests and the dry-run simulator, which is not the same as long
-  production use.
+- **Early, small-scale usage.** It is in use with two businesses and four of
+  their customers so far. The conversation flow is covered by tests and the
+  dry-run simulator, but it has not been proven at larger volume.
