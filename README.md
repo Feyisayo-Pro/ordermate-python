@@ -1,27 +1,48 @@
 # OrderMate
 
-A WhatsApp bot for small businesses: takes orders, tracks them, requests
-feedback after delivery, and automatically asks happy customers for a public
-review — while quietly alerting the owner when a customer isn't happy, before
-it becomes a bad review.
+A multi-tenant WhatsApp platform for small businesses. One WhatsApp number
+serves several businesses at once, across two verticals: **food ordering**
+(multi-item carts, order tracking, delivery, feedback) and **appointment
+booking**. Claude reads each customer message and decides what to do, with a
+deterministic rule-based fallback so the whole flow still runs without an API
+key. After delivery it asks for feedback, requests a public review from happy
+customers, and quietly alerts the owner when someone is unhappy, before it
+becomes a bad review.
 
-This is the Python rebuild of the OrderMate concept, scoped as a fast
-**single-business MVP** (currently configured for "Mama's Kitchen" — see
-`app/business_config.py` to point it at a different business). It runs fully
-locally with zero paid API keys via built-in dry-run/fallback modes, so you
-can develop, test, and demo the entire flow before signing up for anything.
+**What is in it**
+
+- **Multi-tenant by design.** Businesses, menu items and bookable services are
+  database rows (`Business`, `FoodMenuItem`, `AppointmentService`), not a
+  hardcoded constant. Conversation flow, admin dashboard and messaging all work
+  against per-business data.
+- **Language model layer** (`app/ai.py`): intent classification and structured
+  field extraction with Anthropic Claude (Haiku by default), plus a rule-based
+  fallback used when no key is set or the call fails.
+- **Voice notes**: transcribed with Deepgram, then handled like typed text.
+- **Admin dashboard** (`app/admin.py`): orders, appointments, status updates,
+  broadcast campaigns and WhatsApp message templates, behind constant-time
+  Basic Auth.
+- **Campaign messaging** with a two-step confirm, the 24-hour window rule and
+  opt-out handling: customers who opted out are excluded from every broadcast.
+- **Scheduled jobs that survive restarts**: delayed feedback requests,
+  abandoned-order nudges and a weekly owner digest, using APScheduler with a
+  SQLAlchemy job store in the same database.
+- **136 automated tests** across webhook security, conversation flow, AI
+  parsing, appointment booking, the admin dashboard and the digest.
 
 ## Architecture, in one paragraph
 
-FastAPI receives WhatsApp webhooks (`app/main.py`), a small explicit state
-machine per customer (`app/conversation.py` + the `Conversation` table)
-decides what's happening — are they mid-order, being asked for feedback, or
-starting fresh — and delegates the "what did they actually mean" understanding
-to `app/ai.py`, which calls Anthropic's Claude when a key is configured or
-falls back to deterministic rule-based parsing when it isn't. Everything
-persists to SQLite via SQLAlchemy (`app/models.py`). A background scheduler
-(`app/scheduler.py`) fires the feedback request a few hours after an order is
-marked delivered.
+FastAPI receives WhatsApp webhooks (`app/main.py`) after verifying the
+`X-Hub-Signature-256` HMAC. A small explicit state machine per customer
+(`app/conversation.py` + the `Conversation` table) decides what is happening:
+mid-order, mid-booking, being asked for feedback, or starting fresh. It
+resolves which business the customer is talking to (`app/businesses.py`) and
+delegates "what did they actually mean" to `app/ai.py`, which calls Claude when
+a key is configured and falls back to rule-based parsing when it is not.
+Everything persists through SQLAlchemy (`app/models.py`): SQLite by default for
+local development, Postgres in production by changing `DATABASE_URL`. A
+background scheduler (`app/scheduler.py`) fires feedback requests, nudges and
+the weekly digest.
 
 ## Quickstart (no WhatsApp or Anthropic account needed)
 
@@ -59,15 +80,17 @@ end to end, for free, before you've touched Meta's developer portal.
 python -m pytest -v
 ```
 
-Tests cover: webhook signature verification (accepts valid, rejects tampered/
-missing), the Meta verification handshake, the full order-creation flow via
-the actual HTTP webhook endpoint, order tracking, both the high-rating
-(review request) and low-rating (owner alert, no review request) feedback
-branches, malformed/non-message webhook payloads being safely ignored, the
-"speak to a human" handoff (owner alert + customer acknowledgment, with and
-without OWNER_WHATSAPP_NUMBER configured), abandoned-order nudges (scheduled
-while ordering, cancelled on completion, fires after real silence), and the
-weekly digest's aggregation/formatting logic.
+136 tests, by file:
+
+| File | Tests | Covers |
+|---|---|---|
+| `test_conversation_flow.py` | 45 | Order flow over the real HTTP webhook, multi-item carts, cancel and repeat customers, unsubscribe, owner commands, feedback branches (high rating asks for a review, low rating alerts the owner), human handoff, abandoned-order nudges |
+| `test_admin.py` | 24 | Dashboard auth, order status updates, broadcast preview and send, opt-out and 24-hour window handling, templates |
+| `test_whatsapp_client.py` | 22 | Webhook signature verification (valid, tampered, missing), parsing of text, list and button taps and voice-note payloads, dry-run sending, message-template API payloads |
+| `test_ai.py` | 18 | Intent classification, quantity parsing and cart-continuation on both the rules path and the Claude path (including ignoring a hallucinated category), voice notes gated on Deepgram |
+| `test_appointment_booking.py` | 12 | The second vertical: service and slot selection, full booking flow, cancel, owner notification, switching between businesses mid-conversation |
+| `test_digest.py` | 9 | Weekly digest aggregation and formatting |
+| `test_webhook.py` | 6 | Meta verification handshake, malformed and non-message payloads safely ignored |
 
 ## Getting a real WhatsApp Business number (Meta setup guide)
 
@@ -110,9 +133,9 @@ included). Whichever you choose:
 
 - Set all `.env` values as platform secrets/environment variables, **not**
   as a committed file.
-- Switch `DATABASE_URL` to a managed Postgres instance once you have more
-  than one business or meaningful order volume — no code changes needed,
-  SQLAlchemy handles both identically.
+- Use a managed Postgres instance in production by setting `DATABASE_URL`
+  (`psycopg` is already in `requirements.txt`). SQLite is for local
+  development only.
 - Set `FEEDBACK_DELAY_SECONDS` back to a real delay (default is 3 hours).
 
 ## Security notes (read before connecting a real business's number)
@@ -133,6 +156,15 @@ included). Whichever you choose:
 - **No payment card data touches this system.** Payments are handled via an
   external payment link (e.g. Paystack) sent as plain text — this keeps the
   bot entirely out of PCI-DSS scope.
+- **The admin dashboard is closed by default.** It uses HTTP Basic Auth with
+  `ADMIN_USERNAME` / `ADMIN_PASSWORD`, compared with `hmac.compare_digest`
+  (constant time). If either is unset the dashboard returns 503 instead of
+  opening, because it shows customer names, phone numbers and addresses. Basic
+  Auth is only safe over HTTPS, which every deployment platform provides.
+- **Broadcasts respect consent.** Customers who opted out are excluded, anyone
+  outside WhatsApp's 24-hour window is skipped rather than attempted, the
+  owner's own number is excluded, and sending takes a preview step and an
+  explicit second confirmation.
 - **Customer phone numbers and order history are personal data** under
   Nigeria's NDPR. Before connecting real customers, put a basic data
   retention policy in place (how long you keep order/feedback history) and
@@ -142,18 +174,21 @@ included). Whichever you choose:
   returns `200` (see `app/main.py`) — this avoids leaking stack traces and
   avoids Meta's retry storms on non-2xx responses.
 
-## Known limitations of this MVP (be upfront about these with a client)
+## Known limitations (be upfront about these with a client)
 
-- Single business per deployment (see `app/business_config.py`) — fine for
-  a pilot, would need a `Business` table + per-tenant routing to serve
-  multiple clients from one deployment.
-- Scheduled feedback requests use an in-memory job store (APScheduler) —
-  a job is lost if the server restarts before it fires. Acceptable for a
-  pilot's order volume; swap in a persistent job store or a proper task
-  queue (Celery/RQ + Redis) before relying on this at scale.
-- The rule-based AI fallback is intentionally simple (built to run the demo
-  conversation deterministically) — real customers typing in natural,
-  varied Nigerian English will need the Claude-backed path (`ANTHROPIC_API_KEY`
-  set) for reliable understanding in production.
-- Voice note transcription (`DEEPGRAM_API_KEY`) has no rule-based fallback —
-  without it, a voice note gets a "please type instead" reply.
+- **Businesses are defined in code** (`app/businesses.py` seed data) and loaded
+  into the database. Runtime data is per-business and database-backed, but
+  there is no self-service onboarding screen yet.
+- **One shared admin login.** Fine for one owner, not for a team. Per-user
+  accounts with sessions are the natural upgrade.
+- **The scheduler runs inside the web process.** Jobs persist across restarts,
+  but run a single instance: APScheduler does not support several schedulers
+  sharing one job store.
+- **The rule-based fallback is intentionally simple.** Customers typing in
+  natural, varied Nigerian English need the Claude-backed path
+  (`ANTHROPIC_API_KEY` set) for reliable understanding.
+- **Voice notes have no fallback.** Without `DEEPGRAM_API_KEY`, a voice note
+  gets a "please type instead" reply.
+- **Not exercised against a live customer base.** The conversation flow is
+  covered by tests and the dry-run simulator, which is not the same as long
+  production use.
